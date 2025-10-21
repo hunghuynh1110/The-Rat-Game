@@ -1,0 +1,13 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -pedantic -std=gnu99 -pthread
+
+all: ratsclient ratsserver
+
+ratsclient: ratsclient.o protocol.o
+	$(CC) $(CFLAGS) -o ratsclient ratsclient.o protocol.o
+
+ratsserver: ratsserver.o protocol.o
+	$(CC) $(CFLAGS) -o ratsserver ratsserver.o protocol.o
+
+clean:
+	rm -f *.o ratsclient ratsserver
