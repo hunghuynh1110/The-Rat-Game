@@ -172,11 +172,13 @@ void handle_lead(FILE *serverOut, Hand *hand) {
     char card[10];
     if (fgets(card, sizeof(card), stdin) == NULL) {
         fprintf(stderr, "ratsclient: user has quit\n");
+        exit(17);
     }
 
     card[strcspn(card, "\n")] = '\0'; // remove newline
     fprintf(serverOut, "%s\n", card);
     fflush(serverOut);
+
 }
 
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
