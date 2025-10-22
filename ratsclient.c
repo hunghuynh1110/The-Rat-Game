@@ -173,6 +173,10 @@ void handle_lead(FILE *serverOut, Hand *hand) {
     if (fgets(card, sizeof(card), stdin) == NULL) {
         fprintf(stderr, "ratsclient: user has quit\n");
     }
+
+    card[strcspn(card, "\n")] = '\0'; // remove newline
+    fprintf(serverOut, "%s\n", card);
+    fflush(serverOut);
 }
 
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
@@ -228,7 +232,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * If it has the lead, then the hand should be displayed followed by the prompt
              *          Lead>
              */
-            handle_lead(serverOut, hand)
+            handle_lead(serverOut, hand);
             break;
         case 'H':
             /**
@@ -273,6 +277,8 @@ int main(int argc, char *argv[]) {
     // 3. Setup server streams
     FILE *serverOut;
     FILE *serverIn = setup_server_streams(sockfd, &serverOut);
+
+    send_client_info(serverOut, clientName, gameName);
     
     Hand hand;
     char messageBuffer[256];
