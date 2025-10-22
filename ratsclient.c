@@ -12,7 +12,13 @@ void validate_arguments(int argc, char *argv[]);
 int check_and_connect_port(const char *port);
 FILE* setup_server_streams(int sockfd, FILE **serverOut);
 void send_client_info(FILE *serverOut, const char *clientName, const char *gameName);
+
+void display_cards(const Hand* hand, char type);
 void display_hand(const Hand* hand);
+
+void parse_hand_message(const char* message, Hand* hand);
+void handle_message(const char message, FILE* serverOut, Hand* hand);
+
 
 #define MAX_CARDS 13
 #define CARD_LEN 4
@@ -155,6 +161,46 @@ void parse_hand_message(const char* message, Hand* hand) {
     }
 }
 
+void handle_message(const char message, FILE* serverOut, Hand* hand) {
+    switch (message[0]) {
+        case 'M':
+            printf("Info: %s", message+1);
+            break;
+        case 'A':
+            /**
+             * In successive tricks, cards that have been played should be removed. 
+             * Do not remove a card until the server has sent an “A” message
+             * */
+            break;
+        case 'L':
+            /**
+             * When the game starts, the client will wait for the server to ask it to play. 
+             * If it has the lead, then the hand should be displayed followed by the prompt
+             *          Lead>
+             */
+            break;
+        case 'H':
+            /**
+             * If the client does not have the lead, then it will display the hand followed by the prompt
+             *          H <card1> <card2> ... <cardN>\n
+             */
+            break;
+        case 'P':
+            /**
+             * Tells the client to play a card following the lead suit <suit>.
+             * [<suit>] play>
+             */
+            break;
+        case 'O':
+            //end game
+            exit(0);
+            break;
+
+        default:
+            fprintf(stderr, "ratsclient: a protocol error occurred");
+            exit(7)
+    }
+}
 
 
 
@@ -174,6 +220,14 @@ int main(int argc, char *argv[]) {
     FILE *serverOut;
     FILE *serverIn = setup_server_streams(sockfd, &serverOut);
     
+    Hand hand;
+    char messageBuffer[256];
+
+    while (fgets(messageBuffer, sizeof(messageBuffer), serverIn)) {
+        handle_message(messageBuffer, serverOut, &hand);
+    }
+    fprintf(stderr, "ratsclient: a protocol error occurred\n");
+    exit(7);
 
     
     return 0;
