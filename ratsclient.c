@@ -5,7 +5,14 @@
 #include <sys/socket.h> // for socket(), connect(), etc.
 #include <netdb.h>      // for getaddrinfo(), freeaddrinfo(), struct addrinfo
 #include <unistd.h>     // for close(), dup()
-#include <csse2310.h>
+
+#define MAX_CARDS 13
+#define CARD_LEN 4
+
+typedef struct {
+    char cards[MAX_CARDS][CARD_LEN];
+    int count;
+} Hand;
 
 // Function prototypes
 void validate_arguments(int argc, char *argv[]);
@@ -17,16 +24,12 @@ void display_cards(const Hand* hand, char type);
 void display_hand(const Hand* hand);
 
 void parse_hand_message(const char* message, Hand* hand);
-void handle_message(const char message, FILE* serverOut, Hand* hand);
+void handle_message(const char *message, FILE* serverOut, Hand* hand);
 
+void handle_lead(FILE *serverOut, Hand *hand);
+void handle_play(FILE *serverOut, Hand *hand, char leadSuit);
+void handle_accept(Hand *hand, const char *card);
 
-#define MAX_CARDS 13
-#define CARD_LEN 4
-
-typedef struct {
-    char cards[MAX_CARDS][CARD_LEN];
-    int count;
-} Hand;
 
 // Validate command line arguments
 void validate_arguments(int argc, char *argv[]) {
@@ -161,7 +164,53 @@ void parse_hand_message(const char* message, Hand* hand) {
     }
 }
 
-void handle_message(const char message, FILE* serverOut, Hand* hand) {
+void handle_lead(FILE *serverOut, Hand *hand) {
+    display_hand(hand);
+    printf("Lead> ");
+    fflush(stdout);
+
+    char card[10];
+    if (fgets(card, sizeof(card), stdin) == NULL) {
+        fprintf(stderr, "ratsclient: user has quit\n");
+    }
+}
+
+void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
+    display_hand(hand);
+    printf("[%c] play> ", leadSuit);
+    fflush(stdout);
+
+    char card[10];
+    if (fgets(card, sizeof(card), stdin) == NULL) {
+        fprintf(stderr, "ratsclient: user has quit\n");
+        exit(17);
+    }
+
+    card[strcspn(card, "\n")] = '\0';
+    fprintf(serverOut, "%s\n", card);
+    fflush(serverOut);
+}
+
+void handle_accept(Hand *hand, const char *card) {
+    char cleanCard[10];
+    sscanf(card, "%3s", cleanCard);
+
+    for (int i = 0; i < hand->count; i++) {
+        if (strcmp(hand->cards[i], cleanCard) == 0) {
+            // Shift remaining cards left
+            for (int j = i; j < hand->count - 1; j++) {
+                strcpy(hand->cards[j], hand->cards[j + 1]);
+            }
+            hand->count--;
+            break;
+        }
+    }
+}
+
+
+
+
+void handle_message(const char *message, FILE* serverOut, Hand* hand) {
     switch (message[0]) {
         case 'M':
             printf("Info: %s", message+1);
@@ -184,6 +233,8 @@ void handle_message(const char message, FILE* serverOut, Hand* hand) {
              * If the client does not have the lead, then it will display the hand followed by the prompt
              *          H <card1> <card2> ... <cardN>\n
              */
+            parse_hand_message(message, hand);
+            display_hand(hand);
             break;
         case 'P':
             /**
@@ -197,8 +248,8 @@ void handle_message(const char message, FILE* serverOut, Hand* hand) {
             break;
 
         default:
-            fprintf(stderr, "ratsclient: a protocol error occurred");
-            exit(7)
+            fprintf(stderr, "ratsclient: a protocol error occurred\n");
+            exit(7);
     }
 }
 
@@ -222,6 +273,7 @@ int main(int argc, char *argv[]) {
     
     Hand hand;
     char messageBuffer[256];
+    memset(&hand, 0, sizeof(hand));
 
     while (fgets(messageBuffer, sizeof(messageBuffer), serverIn)) {
         handle_message(messageBuffer, serverOut, &hand);
