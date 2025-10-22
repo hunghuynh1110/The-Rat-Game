@@ -12,8 +12,15 @@ void validate_arguments(int argc, char *argv[]);
 int check_and_connect_port(const char *port);
 FILE* setup_server_streams(int sockfd, FILE **serverOut);
 void send_client_info(FILE *serverOut, const char *clientName, const char *gameName);
-void run_game_loop(FILE *serverIn, FILE *serverOut);
-void handle_message(const char *buf, FILE *serverIn, FILE *serverOut);
+
+
+#define MAX_CARDS 13
+#define CARD_Len 4
+
+typedef struct {
+    char cards[MAX_CARDS][CARD_LEN];
+    int count;
+} Hand;
 
 // Validate command line arguments
 void validate_arguments(int argc, char *argv[]) {
@@ -114,41 +121,6 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
     }
 }
 
-// Handle different types of messages from server
-void handle_message(const char *message_buffer, FILE *serverIn, FILE *serverOut) {
-    if (message_buffer[0] == 'M') {
-        // Info message
-        printf("Info: %s", message_buffer + 1);
-        if (message_buffer[strlen(message_buffer)-1] != '\n') printf("\n");
-    } else if (message_buffer[0] == 'H') {
-        // Hand message
-        printf("%s", message_buffer + 1);
-        if (message_buffer[strlen(message_buffer)-1] != '\n') printf("\n");
-    } else if (message_buffer[0] == 'O') {
-        // Game over
-        fclose(serverIn);
-        fclose(serverOut);
-        exit(0);
-    } else {
-        fprintf(stderr, "ratsclient: a protocol error occurred\n");
-        fclose(serverIn);
-        fclose(serverOut);
-        exit(7);
-    }
-}
-
-// Main game loop - receive and process messages from server
-void run_game_loop(FILE *serverIn, FILE *serverOut) {
-    char message_buffer[4096];
-    while (fgets(message_buffer, sizeof(message_buffer), serverIn)) {
-        handle_message(message_buffer, serverIn, serverOut);
-    }
-    // If server closes connection unexpectedly, treat as protocol error
-    fprintf(stderr, "ratsclient: a protocol error occurred\n");
-    fclose(serverIn);
-    fclose(serverOut);
-    exit(7);
-}
 
 // Main function - orchestrates the client execution
 int main(int argc, char *argv[]) {
@@ -165,11 +137,7 @@ int main(int argc, char *argv[]) {
     FILE *serverOut;
     FILE *serverIn = setup_server_streams(sockfd, &serverOut);
     
-    // 4. Send client information
-    send_client_info(serverOut, clientName, gameName);
 
-    // 5. Run game loop
-    run_game_loop(serverIn, serverOut);
     
     return 0;
 }
