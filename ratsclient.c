@@ -220,6 +220,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * In successive tricks, cards that have been played should be removed. 
              * Do not remove a card until the server has sent an “A” message
              * */
+            handle_accept(hand, message+2);
             break;
         case 'L':
             /**
@@ -227,6 +228,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * If it has the lead, then the hand should be displayed followed by the prompt
              *          Lead>
              */
+            handle_lead(serverOut, hand)
             break;
         case 'H':
             /**
@@ -241,6 +243,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * Tells the client to play a card following the lead suit <suit>.
              * [<suit>] play>
              */
+            handle_play(serverOut, hand, message[2]);
             break;
         case 'O':
             //end game
