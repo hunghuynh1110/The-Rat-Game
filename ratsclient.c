@@ -12,7 +12,7 @@ void validate_arguments(int argc, char *argv[]);
 int check_and_connect_port(const char *port);
 FILE* setup_server_streams(int sockfd, FILE **serverOut);
 void send_client_info(FILE *serverOut, const char *clientName, const char *gameName);
-
+void display_hand(const Hand* hand);
 
 #define MAX_CARDS 13
 #define CARD_Len 4
@@ -120,6 +120,30 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
         exit(5);
     }
 }
+
+void display_cards(const Hand* hand, char type) {
+    for (int i = 0; i < hand->count; i++)
+        if (hand->cards[i][strlen(hand->cards[i]) - 1] == type)
+            printf(" %.*s", (int)(strlen(hand->cards[i]) - 1), hand->cards[i]);
+}
+void display_hand(const Hand* hand) {
+    printf("S:");
+    display_cards(hand, 'S');
+
+    printf("C:");
+    display_cards(hand, 'S');
+
+    printf("D:");
+    display_cards(hand, 'S');
+
+    printf("H:");
+    display_cards(hand, 'S');
+
+}
+
+
+
+
 
 
 // Main function - orchestrates the client execution
