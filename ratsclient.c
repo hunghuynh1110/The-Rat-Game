@@ -15,7 +15,7 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
 void display_hand(const Hand* hand);
 
 #define MAX_CARDS 13
-#define CARD_Len 4
+#define CARD_LEN 4
 
 typedef struct {
     char cards[MAX_CARDS][CARD_LEN];
@@ -130,17 +130,30 @@ void display_hand(const Hand* hand) {
     printf("S:");
     display_cards(hand, 'S');
 
-    printf("C:");
-    display_cards(hand, 'S');
+    printf("\nC:");
+    display_cards(hand, 'C');
 
-    printf("D:");
-    display_cards(hand, 'S');
+    printf("\nD:");
+    display_cards(hand, 'D');
 
-    printf("H:");
-    display_cards(hand, 'S');
+    printf("\nH:");
+    display_cards(hand, 'H');
+    printf("\n");
 
 }
 
+
+void parse_hand_message(const char* message, Hand* hand) {
+    hand->count = 0;
+    const char* ptr = message + 1;
+    while(*ptr) {
+        while(*ptr == ' ') ptr ++;
+        if(*ptr == '\n' || *ptr == '\0') break;
+        sscanf(ptr, "%3s", hand->cards[hand->count]);
+        hand->count++;
+        while(*ptr && *ptr != ' ') ptr++;
+    }
+}
 
 
 
