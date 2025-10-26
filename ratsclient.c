@@ -68,17 +68,25 @@ int compare_cards(const void *a, const void *b) {
     const char *cardA = *(const char (*)[CARD_LEN])a;
     const char *cardB = *(const char (*)[CARD_LEN])b;
 
-    int suitA = get_suit_value(cardA[strlen(cardA) - 1]);
-    int suitB = get_suit_value(cardB[strlen(cardB) - 1]);
+    // Rank is at index 0, Suit is at index 1
+    char suitA = cardA[1];
+    char suitB = cardB[1];
 
-    if (suitA != suitB) {
-        return suitA - suitB;
+    int suitValA = get_suit_value(suitA);
+    int suitValB = get_suit_value(suitB);
+
+    if (suitValA != suitValB) {
+        return suitValA - suitValB; // Sort by suit order
     }
 
-    int rankA = get_rank_value(cardA[0]);
-    int rankB = get_rank_value(cardB[0]);
+    // Suits are the same, sort by rank (index 0)
+    char rankA = cardA[0];
+    char rankB = cardB[0];
 
-    return rankB - rankA; // b-a = decreasing order
+    int rankValA = get_rank_value(rankA);
+    int rankValB = get_rank_value(rankB);
+
+    return rankValB - rankValA; // b-a = decreasing order
 }
 
 
@@ -183,10 +191,15 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
 }
 
 void display_cards(const Hand* hand, char type) {
-    for (int i = 0; i < hand->count; i++)
-        if (hand->cards[i][strlen(hand->cards[i]) - 1] == type)
-            printf(" %.*s", (int)(strlen(hand->cards[i]) - 1), hand->cards[i]);
+    for (int i = 0; i < hand->count; i++) {
+        // Card is 2 chars, e.g., "SA". Suit is at index 1.
+        if (hand->cards[i][1] == type) {
+            // Rank is at index 0.
+            printf(" %c", hand->cards[i][0]);
+        }
+    }
 }
+
 void display_hand(const Hand* hand) {
     printf("S:");
     display_cards(hand, 'S');
@@ -206,14 +219,25 @@ void display_hand(const Hand* hand) {
 
 void parse_hand_message(const char* message, Hand* hand) {
     hand->count = 0;
-    const char* ptr = message + 1;
-    while(*ptr) {
-        while(*ptr == ' ') ptr ++;
-        if(*ptr == '\n' || *ptr == '\0') break;
-        sscanf(ptr, "%3s", hand->cards[hand->count]);
+    const char* ptr = message + 1; // Skip 'H'
+    
+    while (*ptr) {
+        while (*ptr == ' ') ptr++; // Skip spaces
+        if (*ptr == '\n' || *ptr == '\0') break;
+        
+        // Cards are always 2 chars, e.g., "SA", "ST", "S2"
+        sscanf(ptr, "%2s", hand->cards[hand->count]); 
+        hand->cards[hand->count][2] = '\0'; // Null-terminate at index 2
         hand->count++;
-        while(*ptr && *ptr != ' ') ptr++;
+        
+        // Move ptr to the next space or end
+        // Move 2 chars for the card we just read
+        ptr += 2;
+        while (*ptr && *ptr == ' ') ptr++; // Skip trailing spaces
     }
+
+    // Sort the hand now that it's fully parsed
+    qsort(hand->cards, hand->count, CARD_LEN, compare_cards);
 }
 
 void handle_lead(FILE *serverOut, Hand *hand) {
@@ -312,10 +336,38 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 }
 
 
+/**
+ * A temporary function to test hand parsing and sorting.
+ */
+void test_hand_sorting() {
+    printf("--- HAND SORTING TEST ---\n");
+    Hand testHand;
 
+    // Test Case 1: Unsorted ranks and a 'T' card
+    const char* msg1 = "H S2 SA D5 D9 CT CA";
+    printf("\nTest 1 Input: %s\n", msg1);
+    printf("Expected:\n");
+    printf("S: SA S2\nC: CA CT\nD: D9 D5\nH:\n");
+    printf("Actual:\n");
+    parse_hand_message(msg1, &testHand);
+    display_hand(&testHand);
+
+    // Test Case 2: Unsorted suits and ranks
+    const char* msg2 = "H HA S2 D9 C3 D5 SA";
+    printf("\nTest 2 Input: %s\n", msg2);
+    printf("Expected:\n");
+    printf("S: SA S2\nC: C3\nD: D9 D5\nH: HA\n");
+    printf("Actual:\n");
+    parse_hand_message(msg2, &testHand);
+    display_hand(&testHand);
+
+    printf("\n--- END OF TEST ---\n");
+    exit(99); // Exit so client doesn't try to connect
+}
 
 // Main function - orchestrates the client execution
 int main(int argc, char *argv[]) {
+    test_hand_sorting(); // <-- TEMPORARY TEST CALL
     // 1. Parse and validate arguments
     validate_arguments(argc, argv);
     char *clientName = argv[1];
