@@ -12,11 +12,9 @@
 typedef struct {
     char cards[MAX_CARDS][CARD_LEN];
     int count;
+    char lastSend[3];
 } Hand;
 
-typedef struct {
-    char lastCard;
-} lastCard;
 
 // Function prototypes
 void validate_arguments(int argc, char *argv[]);
@@ -38,6 +36,9 @@ void handle_accept(Hand *hand, const char *card);
 int get_rank_value(char rank);
 int get_suit_value(char suit);
 int compare_cards(const void *a, const void *b);
+static void remove_card_from_hand(Hand *hand, const char rs[3]);
+
+
 
 int get_rank_value(char rank) {
     if (rank >= '2' && rank <= '9') {
@@ -68,7 +69,7 @@ int compare_cards(const void *a, const void *b) {
     const char *cardA = *(const char (*)[CARD_LEN])a;
     const char *cardB = *(const char (*)[CARD_LEN])b;
 
-    // Rank is at index 0, Suit is at index 1
+    // Suit is at index 1, Rank is at index 0
     char suitA = cardA[1];
     char suitB = cardB[1];
 
@@ -76,19 +77,38 @@ int compare_cards(const void *a, const void *b) {
     int suitValB = get_suit_value(suitB);
 
     if (suitValA != suitValB) {
-        return suitValA - suitValB; // Sort by suit order
+        return suitValA - suitValB; // Sort by suit order (S, C, D, H)
     }
 
-    // Suits are the same, sort by rank (index 0)
+    // Suits are the same, sort by rank in decreasing order
     char rankA = cardA[0];
     char rankB = cardB[0];
 
     int rankValA = get_rank_value(rankA);
     int rankValB = get_rank_value(rankB);
 
-    return rankValB - rankValA; // b-a = decreasing order
+    return rankValB - rankValA; // Decreasing order: larger ranks first
 }
 
+static void remove_card_from_hand(Hand *hand, const char rs[3]) {
+    if (!hand || !rs || rs[0] == '\0' || rs[1] == '\0') return;
+
+    for (int i = 0; i < hand->count; ++i) {
+        char c0 = hand->cards[i][0];
+        char c1 = hand->cards[i][1];
+
+        // Match either rank-suit or (temporarily) suit-rank
+        if ((c0 == rs[0] && c1 == rs[1]) || (c0 == rs[1] && c1 == rs[0])) {
+            // Shift left
+            for (int j = i; j < hand->count - 1; ++j) {
+                memcpy(hand->cards[j], hand->cards[j + 1], CARD_LEN);
+            }
+            memset(hand->cards[hand->count - 1], 0, CARD_LEN);
+            hand->count--;
+            break;
+        }
+    }
+}
 
 
 // Validate command line arguments
@@ -192,9 +212,10 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
 
 void display_cards(const Hand* hand, char type) {
     for (int i = 0; i < hand->count; i++) {
-        // Card is 2 chars, e.g., "SA". Suit is at index 1.
+        // Card is stored as "RankSuit" (rank at index 0, suit at index 1)
+        // Display as "SuitRank" (e.g., "SA")
         if (hand->cards[i][1] == type) {
-            // Rank is at index 0.
+            // Print suit then rank
             printf(" %c", hand->cards[i][0]);
         }
     }
@@ -219,21 +240,23 @@ void display_hand(const Hand* hand) {
 
 void parse_hand_message(const char* message, Hand* hand) {
     hand->count = 0;
-    const char* ptr = message + 1; // Skip 'H'
+    const char* ptr = message + 1; // Skip 'H' or the ' ' after H
     
     while (*ptr) {
-        while (*ptr == ' ') ptr++; // Skip spaces
+        while (*ptr == ' ') ptr++; // Skip leading spaces
         if (*ptr == '\n' || *ptr == '\0') break;
         
-        // Cards are always 2 chars, e.g., "SA", "ST", "S2"
-        sscanf(ptr, "%2s", hand->cards[hand->count]); 
-        hand->cards[hand->count][2] = '\0'; // Null-terminate at index 2
+        // Cards from server are in format "SuitRank" (e.g., "SA", "D2")
+        // We store them as "RankSuit" (rank at index 0, suit at index 1)
+        // First char from server is suit, second is rank
+        hand->cards[hand->count][1] = *ptr++; // Suit goes to index 1
+        hand->cards[hand->count][0] = *ptr++; // Rank goes to index 0
+        hand->cards[hand->count][2] = '\0';   // Null-terminate
+        
         hand->count++;
         
-        // Move ptr to the next space or end
-        // Move 2 chars for the card we just read
-        ptr += 2;
-        while (*ptr && *ptr == ' ') ptr++; // Skip trailing spaces
+        // Skip any spaces after this card
+        while (*ptr && *ptr == ' ') ptr++;
     }
 
     // Sort the hand now that it's fully parsed
@@ -274,19 +297,8 @@ void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
 }
 
 void handle_accept(Hand *hand, const char *card) {
-    char cleanCard[10];
-    sscanf(card, "%3s", cleanCard);
-
-    for (int i = 0; i < hand->count; i++) {
-        if (strcmp(hand->cards[i], cleanCard) == 0) {
-            // Shift remaining cards left
-            for (int j = i; j < hand->count - 1; j++) {
-                strcpy(hand->cards[j], hand->cards[j + 1]);
-            }
-            hand->count--;
-            break;
-        }
-    }
+    remove_car_from_hand(hand, hand->lastSend);
+    hand->lastSend[0] = '\0';
 }
 
 void handle_message(const char *message, FILE* serverOut, Hand* hand) {
@@ -336,38 +348,8 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 }
 
 
-/**
- * A temporary function to test hand parsing and sorting.
- */
-void test_hand_sorting() {
-    printf("--- HAND SORTING TEST ---\n");
-    Hand testHand;
-
-    // Test Case 1: Unsorted ranks and a 'T' card
-    const char* msg1 = "H S2 SA D5 D9 CT CA";
-    printf("\nTest 1 Input: %s\n", msg1);
-    printf("Expected:\n");
-    printf("S: SA S2\nC: CA CT\nD: D9 D5\nH:\n");
-    printf("Actual:\n");
-    parse_hand_message(msg1, &testHand);
-    display_hand(&testHand);
-
-    // Test Case 2: Unsorted suits and ranks
-    const char* msg2 = "H HA S2 D9 C3 D5 SA";
-    printf("\nTest 2 Input: %s\n", msg2);
-    printf("Expected:\n");
-    printf("S: SA S2\nC: C3\nD: D9 D5\nH: HA\n");
-    printf("Actual:\n");
-    parse_hand_message(msg2, &testHand);
-    display_hand(&testHand);
-
-    printf("\n--- END OF TEST ---\n");
-    exit(99); // Exit so client doesn't try to connect
-}
-
 // Main function - orchestrates the client execution
 int main(int argc, char *argv[]) {
-    test_hand_sorting(); // <-- TEMPORARY TEST CALL
     // 1. Parse and validate arguments
     validate_arguments(argc, argv);
     char *clientName = argv[1];
