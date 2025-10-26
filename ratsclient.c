@@ -14,6 +14,10 @@ typedef struct {
     int count;
 } Hand;
 
+typedef struct {
+    char lastCard;
+} lastCard;
+
 // Function prototypes
 void validate_arguments(int argc, char *argv[]);
 int check_and_connect_port(const char *port);
@@ -29,7 +33,22 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand);
 void handle_lead(FILE *serverOut, Hand *hand);
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit);
 void handle_accept(Hand *hand, const char *card);
+int get_rank_value(char rank) ;
 
+
+int get_rank_value(char rank) {
+    if (rank >= '2' && rank <= '9') {
+        return rank - '0';
+    }
+    switch (rank) {
+        case 'A': return 14;
+        case 'K': return 13;
+        case 'Q': return 12;
+        case 'J': return 11;
+        case 'T': return 10;
+        default: return 0; // Should not happen
+    }
+}
 
 // Validate command line arguments
 void validate_arguments(int argc, char *argv[]) {
@@ -212,9 +231,6 @@ void handle_accept(Hand *hand, const char *card) {
         }
     }
 }
-
-
-
 
 void handle_message(const char *message, FILE* serverOut, Hand* hand) {
     switch (message[0]) {
