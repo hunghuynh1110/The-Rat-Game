@@ -30,7 +30,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand);
 
 void handle_lead(FILE *serverOut, Hand *hand);
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit);
-void handle_accept(Hand *hand, const char *card);
+void handle_accept(Hand *hand);
 
 //helper funct
 int get_rank_value(char rank);
@@ -237,7 +237,7 @@ void display_hand(const Hand* hand) {
 
 }
 
-
+//done
 void parse_hand_message(const char* message, Hand* hand) {
     hand->count = 0;
     const char* ptr = message + 1; // Skip 'H' or the ' ' after H
@@ -249,8 +249,8 @@ void parse_hand_message(const char* message, Hand* hand) {
         // Cards from server are in format "SuitRank" (e.g., "SA", "D2")
         // We store them as "RankSuit" (rank at index 0, suit at index 1)
         // First char from server is suit, second is rank
-        hand->cards[hand->count][1] = *ptr++; // Suit goes to index 1
-        hand->cards[hand->count][0] = *ptr++; // Rank goes to index 0
+        hand->cards[hand->count][0] = *ptr++; // rank first
+        hand->cards[hand->count][1] = *ptr++; // suit second
         hand->cards[hand->count][2] = '\0';   // Null-terminate
         
         hand->count++;
@@ -268,14 +268,25 @@ void handle_lead(FILE *serverOut, Hand *hand) {
     printf("Lead> ");
     fflush(stdout);
 
-    char card[10];
-    if (fgets(card, sizeof(card), stdin) == NULL) {
+    char input[16];
+    if (fgets(input, sizeof(input), stdin) == NULL) {
         fprintf(stderr, "ratsclient: user has quit\n");
         exit(17);
     }
 
-    card[strcspn(card, "\n")] = '\0'; // remove newline
-    fprintf(serverOut, "%s\n", card);
+    input[strcspn(input, "\n")] = '\0';
+
+    // Capture the first token and remember first two chars as the card we intend
+    char token[8] = {0};
+    if (sscanf(input, " %7s", token) == 1 && strlen(token) >= 2) {
+        hand->lastSend[0] = token[0];
+        hand->lastSend[1] = token[1];
+        hand->lastSend[2] = '\0';
+        fprintf(serverOut, "%s\n", token);
+    } else {
+        hand->lastSend[0] = '\0';
+        fprintf(serverOut, "%s\n", input);
+    }
     fflush(serverOut);
 
 }
@@ -292,13 +303,24 @@ void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
     }
 
     card[strcspn(card, "\n")] = '\0';
+    if (strlen(card) >= 2) {
+        hand->lastSend[0] = card[0];
+        hand->lastSend[1] = card[1];
+        hand->lastSend[2] = '\0';
+    } else {
+        hand->lastSend[0] = hand->lastSend[1] = hand->lastSend[2] = '\0';
+    }
     fprintf(serverOut, "%s\n", card);
     fflush(serverOut);
 }
 
-void handle_accept(Hand *hand, const char *card) {
-    remove_car_from_hand(hand, hand->lastSend);
-    hand->lastSend[0] = '\0';
+void handle_accept(Hand *hand) {
+    if (hand->lastSend[0] != '\0' && hand->lastSend[1] != '\0') {
+        remove_card_from_hand(hand, hand->lastSend);   // <- fixed name
+        hand->lastSend[0] = '\0';
+        hand->lastSend[1] = '\0';
+        hand->lastSend[2] = '\0';
+    }
 }
 
 void handle_message(const char *message, FILE* serverOut, Hand* hand) {
@@ -311,7 +333,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * In successive tricks, cards that have been played should be removed. 
              * Do not remove a card until the server has sent an “A” message
              * */
-            handle_accept(hand, message+2);
+            handle_accept(hand);
             break;
         case 'L':
             /**
@@ -334,7 +356,18 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * Tells the client to play a card following the lead suit <suit>.
              * [<suit>] play>
              */
-            handle_play(serverOut, hand, message[2]);
+            char suit;
+            if (sscanf(message, "P %c", &suit) != 1 && sscanf(message, "P%c", &suit) != 1) {
+                fprintf(stderr, "ratsclient: a protocol error occurred\n");
+                exit(7);
+            }
+            // sanity-check the suit
+            if (suit != 'S' && suit != 'C' && suit != 'D' && suit != 'H') {
+                fprintf(stderr, "ratsclient: a protocol error occurred\n");
+                exit(7);
+            }
+
+            handle_play(serverOut, hand, suit);
             break;
         case 'O':
             //end game
