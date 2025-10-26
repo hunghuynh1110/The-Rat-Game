@@ -33,8 +33,11 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand);
 void handle_lead(FILE *serverOut, Hand *hand);
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit);
 void handle_accept(Hand *hand, const char *card);
-int get_rank_value(char rank) ;
 
+//helper funct
+int get_rank_value(char rank);
+int get_suit_value(char suit);
+int compare_cards(const void *a, const void *b);
 
 int get_rank_value(char rank) {
     if (rank >= '2' && rank <= '9') {
@@ -49,6 +52,36 @@ int get_rank_value(char rank) {
         default: return 0; // Should not happen
     }
 }
+
+int get_suit_value(char suit) {
+    switch (suit) {
+        case 'S': return 0;
+        case 'C': return 1;
+        case 'D': return 2;
+        case 'H': return 3;
+        default:
+            return 4;
+        }
+}
+
+int compare_cards(const void *a, const void *b) {
+    const char *cardA = *(const char (*)[CARD_LEN])a;
+    const char *cardB = *(const char (*)[CARD_LEN])b;
+
+    int suitA = get_suit_value(cardA[strlen(cardA) - 1]);
+    int suitB = get_suit_value(cardB[strlen(cardB) - 1]);
+
+    if (suitA != suitB) {
+        return suitA - suitB;
+    }
+
+    int rankA = get_rank_value(cardA[0]);
+    int rankB = get_rank_value(cardB[0]);
+
+    return rankB - rankA; // b-a = decreasing order
+}
+
+
 
 // Validate command line arguments
 void validate_arguments(int argc, char *argv[]) {
