@@ -351,7 +351,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
             parse_hand_message(message, hand);
             display_hand(hand);
             break;
-        case 'P':
+        case 'P': {
             /**
              * Tells the client to play a card following the lead suit <suit>.
              * [<suit>] play>
@@ -369,6 +369,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 
             handle_play(serverOut, hand, suit);
             break;
+        }
         case 'O':
             //end game
             exit(0);
