@@ -1215,7 +1215,31 @@ static int play_tricks(ServerContext *serverCtx, Game *game,
     return 0; // completed normally
 }
 
-// --- helpers: prompts & invalids (≤ 20 LOC each) ---
+/**
+ * send_lead_or_play_prompt
+ * ------------------------
+ * Emits the appropriate prompt for the player's next action according to the
+ * protocol: leader gets a "lead" prompt; non-leaders get a "play" prompt that
+ * may reference the current trick's lead suit (if required by the spec).
+ *
+ * Parameters:
+ *   out       - per-player FILE* to write the prompt to (line-buffered OK).
+ *   isLeader  - true iff this seat is leading the trick.
+ *   leadSuit  - the current trick's lead suit (e.g., 'S','H','D','C'); may be
+ *               '\0' when unknown/not applicable at prompt time.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   - Writes a single protocol line to 'out' (e.g., "L\n" or "A\n", or a
+ *     suit-bearing variant if the protocol requires it), and flushes it.
+ *
+ * Concurrency:
+ *   Called from the single game loop context for one table; no locking here.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static void send_lead_or_play_prompt(FILE* out, bool isLeader, char leadSuit) {
     if (isLeader) {
         send_line(out, "L");
@@ -1225,6 +1249,31 @@ static void send_lead_or_play_prompt(FILE* out, bool isLeader, char leadSuit) {
     }
 }
 
+/**
+ * send_invalid_and_reprompt
+ * -------------------------
+ * Notifies the client that their previous input was invalid per protocol/game
+ * rules (e.g., not in hand or failed follow-suit), then immediately issues the
+ * correct prompt again (lead vs play) so the client can retry.
+ *
+ * Parameters:
+ *   out       - per-player FILE* to write the error/reprompt lines to.
+ *   isLeader  - true iff the client is expected to lead after the error.
+ *   leadSuit  - the current trick's lead suit used when re-prompting followers
+ *               (may be '\0' if not yet established or not required).
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   - Writes one error/invalid indication line followed by the appropriate
+ *     prompt line to 'out', flushing as needed per protocol expectations.
+ *
+ * Concurrency:
+ *   Used within the single-threaded trick loop for the table; no shared locks.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static void send_invalid_and_reprompt(FILE* out, bool isLeader, char leadSuit) {
     if (isLeader) {
         send_line(out, "L");
