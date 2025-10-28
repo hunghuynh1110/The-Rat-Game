@@ -57,6 +57,7 @@ typedef struct {
 #define MAX_HAND 52
 #define NUM104 104
 
+#define MAX_STR_LEN_10 10
 #define MAX_CARD_RANK 26
 
 #define LISTEN_PORT_ERROR 6
@@ -138,8 +139,21 @@ static void announce_trick_winner(FILE *outs[MAX_PLAYERS], const Game* game, int
 static int seat_to_team(int seat);
 static void announce_final_score(FILE *outs[MAX_PLAYERS], int team1Tricks, int team2Tricks);
 
+//helper
+static int read_and_apply_valid_card(ServerContext *serverCtx, Game *game,
+                                     int seat, int trickOffset, bool isLeader,
+                                     char *leadSuitInOut, FILE *in, FILE *out,
+                                     PlayerHand *hand,
+                                     FILE *outs[MAX_PLAYERS],
+                                     char plays[MAX_PLAYERS][2]);
+static int handle_disconnect_early(ServerContext *serverCtx, Game *game,
+                                   int seat, FILE *outs[MAX_PLAYERS]);
+static int play_single_trick(ServerContext *serverCtx, Game *game,
+                             FILE *ins[MAX_PLAYERS], FILE *outs[MAX_PLAYERS],
+                             PlayerHand hands[MAX_PLAYERS],
+                             int leaderSeat, int *winnerSeatOut);
 
-//SIGHUP
+// SIGHUP
 static void *stats_sigwait_thread(void *arg);
 static void start_sighup_stats_thread(ServerContext *ctx);
 static void *pending_fd_monitor_thread(void *arg);
@@ -194,7 +208,7 @@ static bool parse_maxconns(const char* s, unsigned* out) {
 
     errno = 0;
     char* end = NULL;
-    long v = strtol(s, &end, 10);  // accepts optional leading '+'
+    long v = strtol(s, &end, MAX_STR_LEN_10);  // accepts optional leading '+'
     if (errno != 0) {
         return false;
     }
@@ -320,14 +334,12 @@ static void* client_greeting_thread(void* threadArg) {
     int clientFd = clientArg->fd;
     const char* greetingMessage = clientArg->greeting;
     ServerContext *serverCtx = clientArg->serverCtx;
-
     FILE* clientOut = fdopen(dup(clientFd), "w");
     if (clientOut) {
         fprintf(clientOut, "M%s\n", greetingMessage);
         fflush(clientOut);
         fclose(clientOut);
     }
-
     FILE* clientIn = fdopen(dup(clientFd), "r");
     if (!clientIn) {
         close(clientFd);
@@ -336,13 +348,10 @@ static void* client_greeting_thread(void* threadArg) {
         free(clientArg);
         return NULL;
     }
-
     char *playerName = NULL;
     Game *game = NULL;
-
     int seatIndex = handle_client_join(serverCtx, clientFd, clientIn, &playerName, &game);
     fclose(clientIn);
-
     if (seatIndex < 0) {
         close(clientFd);
         atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
@@ -351,18 +360,14 @@ static void* client_greeting_thread(void* threadArg) {
         free(clientArg);
         return NULL;
     }
-
     free(playerName);
-
     //check if full
     if (seatIndex < (MAX_PLAYERS - 1)) {
         free(clientArg);
         return NULL;
     }
-
     // seatIndex == 3 -> game just became full; prevent further joins on this game.
     unlink_pending_game(serverCtx, game);
-    // TODO: 
     start_game(serverCtx, game);
     free(clientArg);
     return NULL;
@@ -390,10 +395,8 @@ static void* client_greeting_thread(void* threadArg) {
 static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx) {
     for (;;) {
         acquire_conn_slot(serverCtx);
-
         int clientFd = -1;
         bool restartOuter = false;
-
         for (;;) {
             struct sockaddr_in clientAddr;
             socklen_t clientLen = sizeof clientAddr;
@@ -406,12 +409,8 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
             break;
         }
         if (restartOuter) continue;
-
-        // NEW: count this accepted socket as a connected player,
-        // and bump the cumulative total-players metric.
         atomic_fetch_add(&serverCtx->activeClientSockets, 1u);
         atomic_fetch_add(&serverCtx->totalPlayersConnected, 1u);
-
         ClientArg *clientArg = malloc(sizeof *clientArg);
         if (!clientArg) {
             close(clientFd);
@@ -423,7 +422,6 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
         clientArg->fd = clientFd;
         clientArg->greeting = greeting;
         clientArg->serverCtx = serverCtx;
-
         pthread_t threadId;
         if (pthread_create(&threadId, NULL, client_greeting_thread, clientArg) != 0) {
             close(clientFd);
@@ -1178,108 +1176,25 @@ static bool parse_card_token(const char *line, char *rankOut, char *suitOut) {
  *
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
-static int play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[MAX_PLAYERS], FILE *outs[MAX_PLAYERS], PlayerHand hands[MAX_PLAYERS]) {
+static int play_tricks(ServerContext *serverCtx, Game *game,
+                       FILE *ins[MAX_PLAYERS], FILE *outs[MAX_PLAYERS],
+                       PlayerHand hands[MAX_PLAYERS]) {
     (void)game;
-
     int teamTricks[2] = {0, 0};
     int leaderSeat = 0;
 
     for (int trick = 0; trick < MAX_TRICK; ++trick) {
-        char plays[MAX_PLAYERS][2] = {{0}};
-        char leadSuit = 0;
-
-        for (int offset = 0; offset < MAX_PLAYERS; ++offset) {
-            int seat = (leaderSeat + offset) % MAX_PLAYERS;
-
-            if (offset == 0) {
-                send_line(outs[seat], "L");
-            } else {
-                char prompt[MAX_PLAYERS - 1] = { 'P', leadSuit, '\0' };
-                send_line(outs[seat], prompt);
-            }
-
-            for (;;) {
-                char *line = read_line_alloc(ins[seat]);
-                if (!line) {
-                    // Seat disconnected: tell others and end the game as terminated.
-                    const char *disp = NULL;
-                    char fallback[MAX_PLAYERS - 1];
-                    if (game && seat >= 0 && seat < MAX_PLAYERS &&
-                        game->playerNames[seat] && game->playerNames[seat][0]) {
-                        disp = game->playerNames[seat];
-                    } else {
-                        fallback[0] = 'P';
-                        fallback[1] = (char)('1' + seat);
-                        fallback[2] = '\0';
-                        disp = fallback;
-                    }
-                    for (int j = 0; j < MAX_PLAYERS; ++j) {
-                        if (j == seat || !outs[j]) continue;
-                        fprintf(outs[j], "M%s disconnected early\n", disp);
-                        fputs("O\n", outs[j]);
-                        fflush(outs[j]);
-                    }
-                    atomic_fetch_add(&serverCtx->gamesTerminated, 1u);
-                    return 1; // terminated
-                }
-
-                char r, s;
-                bool ok = parse_card_token(line, &r, &s);
-                free(line);
-
-                if (!ok) {
-                    if (offset == 0) {
-                        send_line(outs[seat], "L");
-                    } else {
-                        send_line(outs[seat], "I");
-                        char rePrompt[MAX_PLAYERS - 1] = { 'P', leadSuit, '\0' };
-                        send_line(outs[seat], rePrompt);
-                    }
-                    continue;
-                }
-
-                // Must follow suit if possible (for followers)
-                if (offset > 0 && has_suit_in_hand(&hands[seat], leadSuit) && s != leadSuit) {
-                    send_line(outs[seat], "I");
-                    char rePrompt[MAX_PLAYERS - 1] = { 'P', leadSuit, '\0' };
-                    send_line(outs[seat], rePrompt);
-                    continue;
-                }
-
-                // Card must exist in player's hand
-                if (!remove_card_from_hand(&hands[seat], r, s)) {
-                    if (offset == 0) {
-                        send_line(outs[seat], "L");
-                    } else {
-                        send_line(outs[seat], "I");
-                        char rePrompt[MAX_PLAYERS - 1] = { 'P', leadSuit, '\0' };
-                        send_line(outs[seat], rePrompt);
-                    }
-                    continue;
-                }
-
-                plays[offset][0] = r;
-                plays[offset][1] = s;
-                if (offset == 0) {
-                    leadSuit = s;
-                }
-                send_line(outs[seat], "A");
-                announce_play(outs, game, seat, r, s);
-                break;
-            }
+        int winnerSeat = 0;
+        if (play_single_trick(serverCtx, game, ins, outs, hands,
+                              leaderSeat, &winnerSeat)) {
+            return 1; // terminated
         }
-
-        int winOffset = winning_seat_in_trick(leadSuit, plays);
-        int winnerSeat = (leaderSeat + winOffset) % MAX_PLAYERS;
-        announce_trick_winner(outs, game, winnerSeat);
         teamTricks[seat_to_team(winnerSeat)]++;
-        atomic_fetch_add(&serverCtx->totalTricksPlayed, 1u);
         leaderSeat = winnerSeat;
     }
 
     announce_final_score(outs, teamTricks[0], teamTricks[1]);
 
-    // Game over: send O to all
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         if (outs[i]) {
             fputs("O\n", outs[i]);
@@ -1287,6 +1202,120 @@ static int play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[MAX_PLAYE
         }
     }
     return 0; // completed normally
+}
+
+// --- helpers: prompts & invalids (≤ 20 LOC each) ---
+static void send_lead_or_play_prompt(FILE* out, bool isLeader, char leadSuit) {
+    if (isLeader) {
+        send_line(out, "L");
+    } else {
+        char buf[MAX_PLAYERS-1] = { 'P', leadSuit, '\0' };
+        send_line(out, buf);
+    }
+}
+
+static void send_invalid_and_reprompt(FILE* out, bool isLeader, char leadSuit) {
+    if (isLeader) {
+        send_line(out, "L");
+    } else {
+        send_line(out, "I");
+        char buf[MAX_PLAYERS-1] = { 'P', leadSuit, '\0' };
+        send_line(out, buf);
+    }
+}
+
+// --- helper: announce early disconnect & terminate game (≈ 30 LOC) ---
+static int handle_disconnect_early(ServerContext* serverCtx, Game* game,
+                                   int seat, FILE* outs[MAX_PLAYERS]) {
+    const char* disp = NULL;
+    char fallback[MAX_PLAYERS-1];
+    if (game && seat >= 0 && seat < MAX_PLAYERS &&
+        game->playerNames[seat] && game->playerNames[seat][0]) {
+        disp = game->playerNames[seat];
+    } else {
+        fallback[0] = 'P';
+        fallback[1] = (char)('1' + seat);
+        fallback[2] = '\0';
+        disp = fallback;
+    }
+    for (int j = 0; j < MAX_PLAYERS; ++j) {
+        if (j == seat || !outs[j]) continue;
+        fprintf(outs[j], "M%s disconnected early\n", disp);
+        fputs("O\n", outs[j]);
+        fflush(outs[j]);
+    }
+    atomic_fetch_add(&serverCtx->gamesTerminated, 1u);
+    return 1; // terminated
+}
+
+// --- helper: read, validate, apply a single play (≈ 45 LOC) ---
+static int read_and_apply_valid_card(ServerContext* serverCtx, Game* game,
+                                     int seat, int trickOffset, bool isLeader,
+                                     char* leadSuitInOut, FILE* in, FILE* out,
+                                     PlayerHand* hand,
+                                     FILE* outs[MAX_PLAYERS],
+                                     char plays[MAX_PLAYERS][2]) {
+    for (;;) {
+        char* line = read_line_alloc(in);
+        if (!line) {
+            return handle_disconnect_early(serverCtx, game, seat, outs);
+        }
+
+        char r = 0, s = 0;
+        bool ok = parse_card_token(line, &r, &s);
+        free(line);
+        if (!ok) {
+            send_invalid_and_reprompt(out, isLeader, *leadSuitInOut);
+            continue;
+        }
+
+        if (!isLeader && has_suit_in_hand(hand, *leadSuitInOut) && s != *leadSuitInOut) {
+            send_invalid_and_reprompt(out, false, *leadSuitInOut);
+            continue;
+        }
+
+        if (!remove_card_from_hand(hand, r, s)) {
+            send_invalid_and_reprompt(out, isLeader, *leadSuitInOut);
+            continue;
+        }
+
+        if (isLeader) *leadSuitInOut = s;
+        plays[trickOffset][0] = r;
+        plays[trickOffset][1] = s;
+
+        send_line(out, "A");
+        announce_play(outs, game, seat, r, s);
+        return 0; // success
+    }
+}
+
+// --- helper: play a single trick; returns 0 ok / 1 terminated (≈ 45 LOC) ---
+static int play_single_trick(ServerContext* serverCtx, Game* game,
+                             FILE* ins[MAX_PLAYERS], FILE* outs[MAX_PLAYERS],
+                             PlayerHand hands[MAX_PLAYERS],
+                             int leaderSeat, int* winnerSeatOut) {
+    char plays[MAX_PLAYERS][2] = {{0}};
+    char leadSuit = 0;
+
+    for (int offset = 0; offset < MAX_PLAYERS; ++offset) {
+        int seat = (leaderSeat + offset) % MAX_PLAYERS;
+        bool isLeader = (offset == 0);
+
+        send_lead_or_play_prompt(outs[seat], isLeader, leadSuit);
+
+        if (read_and_apply_valid_card(serverCtx, game, seat, offset, isLeader,
+                                      &leadSuit, ins[seat], outs[seat], &hands[seat],
+                                      outs, plays)) {
+            return 1; // terminated
+        }
+    }
+
+    int winOffset = winning_seat_in_trick(leadSuit, plays);
+    int winnerSeat = (leaderSeat + winOffset) % MAX_PLAYERS;
+    announce_trick_winner(outs, game, winnerSeat);
+    atomic_fetch_add(&serverCtx->totalTricksPlayed, 1u);
+    *winnerSeatOut = winnerSeat;
+    return 0;
 }
 
 /**
