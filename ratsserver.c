@@ -875,7 +875,7 @@ static void deal_and_send_hands(FILE *outs[MAX_PLAYERS], const char *deckStr) {
     }
     char hand[MAX_HAND + 1];
     hand[MAX_HAND] = '\0';
-    char line[HALF_MSG_SIZE];
+    char line[MAX_HAND+2];
     for (int p = 0; p < MAX_PLAYERS; ++p) {
         int k = 0;
         for (int i = p * 2; i < NUM104 && k < NUM26; i+=NUM8) {
@@ -1421,7 +1421,7 @@ static void announce_final_score(FILE *outs[MAX_PLAYERS], int team1Tricks, int t
         return;
     }
     // Determine winner and winning trick count; if draw, report draw explicitly (fallback).
-    char line[HALF_MSG_SIZE];
+    char line[MAX_MSG_SIZE];
     if (team1Tricks > team2Tricks) {
         snprintf(line, sizeof line, "MWinner is Team 1 (%d tricks won)\n", team1Tricks);
     } else if (team2Tricks > team1Tricks) {
