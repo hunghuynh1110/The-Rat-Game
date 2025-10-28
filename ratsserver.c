@@ -18,19 +18,43 @@
 
 #define EXIT_INVALID_PORT 1  // ← set this to the spec’s † value if different
 
+typedef struct ServerContext ServerContext; // forward-declare for pointer usage
 typedef struct {
     int fd;
     const char *greeting;
+    ServerContext *serverCtx;  // server state (no globals per spec)
 } ClientArg;
+
+#define MAX_GAME_NAME 256
+#define MAX_PLAYER 4
+
+typedef struct Game {
+    char gameName[MAX_GAME_NAME];
+    int playerCount;
+    struct Game *next;
+} Game;
+
+// All shared server state lives in this context and is passed around — no globals.
+struct ServerContext {
+    Game *pendingGamesHead;
+    pthread_mutex_t pendingGamesMutex;
+
+    unsigned maxConns;
+    unsigned activeClients;
+    pthread_cond_t canAccept;
+};
 
 
 static void die_usage(void);
 static bool parse_maxconns(const char* s, unsigned* out);
 static int listen_and_report_port(const char* portMsg, const char* service);
 static void block_sigpipe_all_threads(void);
-static void accept_loop(int listenFd, const char *greeting);
+static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx);
 static char *read_line_alloc(FILE *inStream);
 static void send_line(FILE *outStream, const char *text);
+static bool read_join_info(FILE *inStream, char **playerNameOut, char **gameNameOut);
+static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* gameName);
+
 
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
@@ -144,7 +168,7 @@ static void* client_greeting_thread(void* threadArg) {
 
 
 // main server loop that accepts clients and hands each to a detached thread that sends the greeting.
-static void accept_loop(int listenFd, const char *greeting) {
+static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx) {
     while(true) {
         struct sockaddr_in clientAddr;
         socklen_t clientLen = sizeof clientAddr;
@@ -159,12 +183,13 @@ static void accept_loop(int listenFd, const char *greeting) {
         }
 
         ClientArg *clientArg = malloc(sizeof *clientArg);
-        if(!clientArg) {
+        if (!clientArg) {
             close(clientFd);
             continue;
         }
         clientArg->fd = clientFd;
         clientArg->greeting = greeting;
+        clientArg->serverCtx = serverCtx;
 
         pthread_t threadId;
         if(pthread_create(&threadId, NULL, client_greeting_thread, clientArg) != 0) {
@@ -207,6 +232,63 @@ static void send_line(FILE *outStream, const char *text) {
     
 }
 
+static bool read_join_info(FILE *inStream, char **playerNameOut, char **gameNameOut) {
+    if(!inStream || !playerNameOut || !gameNameOut) {
+        return false;
+    }
+    char *playerName = read_line_alloc(inStream);
+    if(!playerName || playerName[0] == '\0') {
+        free(playerName);
+        return false;
+    }
+
+    char* gameName = read_line_alloc(inStream);
+    if (!gameName || gameName[0] == '\0') {
+        free(playerName);
+        free(gameName);
+        return false;
+    }
+
+    *playerNameOut = playerName;
+    *gameNameOut = gameName;
+
+    return true;
+}
+
+//looks up a pending game by name in serverCtx -> create it at head if not found
+static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* gameName) {
+    if(!serverCtx || !gameName || !*gameName) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+
+    //search existing games
+    Game *game = serverCtx->pendingGamesHead;
+    while(game) {
+        if(strcmp(game->gameName , gameName) == 0) {
+            pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+            return game;
+        }
+        game = game->next;
+    }
+
+    //not found
+    Game *newGame = calloc(1, sizeof *newGame);
+    if(!newGame) {
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+        return NULL;
+    }
+
+    snprintf(newGame->gameName, sizeof newGame->gameName, "%s", gameName);
+    newGame->playerCount = 0;
+    newGame->next = serverCtx->pendingGamesHead;
+    serverCtx->pendingGamesHead = newGame;
+
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+    return newGame;
+}
+
 int main(int argc, char** argv) {
     // Usage checking: only shape/emptiness here
     if (argc != 3 && argc != 4) {
@@ -234,10 +316,15 @@ int main(int argc, char** argv) {
     // Validate/bind/listen on the port; prints actual bound port to stderr
     int listenFd = listen_and_report_port(portArg, portArg);
 
-    // TODO (later): enforce maxconnsValue with a mutex/cond around accept()
-    (void)maxconnsValue;
+    // Initialize shared server context (no globals)
+    ServerContext serverCtx;
+    serverCtx.pendingGamesHead = NULL;
+    pthread_mutex_init(&serverCtx.pendingGamesMutex, NULL);
+    serverCtx.maxConns = maxconnsValue;
+    serverCtx.activeClients = 0;
+    pthread_cond_init(&serverCtx.canAccept, NULL);
 
     // Serve forever
-    accept_loop(listenFd, greeting);
+    accept_loop(listenFd, greeting, &serverCtx);
     return 0;
 }
