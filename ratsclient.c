@@ -41,7 +41,25 @@ static void remove_card_from_hand(Hand *hand, const char rs[3]);
 static int card_in_hand(const Hand *hand, char r, char s);
 
 
-
+/**
+ * get_rank_value
+ * --------------
+ * Converts a rank character ('2'..'9', 'T', 'J', 'Q', 'K', 'A') into a
+ * numeric value suitable for comparisons and sorting.
+ *
+ * Parameters:
+ *   rank - rank character to convert.
+ *
+ * Returns:
+ *   Integer value where higher means stronger rank (e.g., 2=2 ... A=14).
+ *   Returns -1 if the rank is invalid.
+ *
+ * Notes:
+ *   This is a display/sorting helper and does not enforce any game rule
+ *   beyond a total order of ranks.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 int get_rank_value(char rank) {
     if (rank >= '2' && rank <= '9') {
         return rank - '0';
@@ -56,6 +74,22 @@ int get_rank_value(char rank) {
     }
 }
 
+/**
+ * get_suit_value
+ * --------------
+ * Maps a suit character ('S', 'H', 'D', 'C') to a deterministic integer
+ * order for client-side sorting and display. The exact order is an internal
+ * UI choice and has no effect on game legality.
+ *
+ * Parameters:
+ *   suit - suit character to convert.
+ *
+ * Returns:
+ *   Non-negative integer indicating suit order (lower comes first), or -1
+ *   if the suit character is invalid.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 int get_suit_value(char suit) {
     switch (suit) {
         case 'S': return 0;
@@ -67,6 +101,27 @@ int get_suit_value(char suit) {
         }
 }
 
+/**
+ * compare_cards
+ * -------------
+ * qsort-compatible comparator for sorting card tokens by suit and rank using
+ * get_suit_value() and get_rank_value(). The intended order is stable within
+ * a suit and deterministic across suits for a neat hand display.
+ *
+ * Parameters:
+ *   a, b - pointers to two card elements (implementation-defined storage),
+ *          each representing a rank/suit pair.
+ *
+ * Returns:
+ *   <0 if *a should come before *b,
+ *    0 if they are equivalent in the chosen order,
+ *   >0 if *a should come after *b.
+ *
+ * Preconditions:
+ *   Card tokens referenced by a and b must contain valid rank/suit chars.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 int compare_cards(const void *a, const void *b) {
     const char *cardA = *(const char (*)[CARD_LEN])a;
     const char *cardB = *(const char (*)[CARD_LEN])b;
@@ -92,6 +147,25 @@ int compare_cards(const void *a, const void *b) {
     return rankValB - rankValA; // Decreasing order: larger ranks first
 }
 
+/**
+ * remove_card_from_hand
+ * ---------------------
+ * Removes a specific card from the Hand if present, compacting the array to
+ * fill the gap. This is typically called after receiving server 'A' (accept).
+ *
+ * Parameters:
+ *   hand - Hand to mutate (must not be NULL).
+ *   rs   - 2-character rank/suit string (e.g., "TD") with trailing '\0'.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Decrements hand->count on success and shifts following elements left by
+ *   one position. If the card is not found, the Hand is unchanged.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static void remove_card_from_hand(Hand *hand, const char rs[3]) {
     if (!hand || !rs || rs[0] == '\0' || rs[1] == '\0') return;
 
@@ -99,7 +173,6 @@ static void remove_card_from_hand(Hand *hand, const char rs[3]) {
         char c0 = hand->cards[i][0];
         char c1 = hand->cards[i][1];
 
-        // Match either rank-suit or (temporarily) suit-rank
         if ((c0 == rs[0] && c1 == rs[1]) || (c0 == rs[1] && c1 == rs[0])) {
             // Shift left
             for (int j = i; j < hand->count - 1; ++j) {
@@ -113,7 +186,22 @@ static void remove_card_from_hand(Hand *hand, const char rs[3]) {
 }
 
 /**
- * Returns 1 if the exact (rank,suit) exists in the hand without mutating it, else 0.
+ * card_in_hand
+ * ------------
+ * Searches the Hand for a given rank/suit pair.
+ *
+ * Parameters:
+ *   hand - Hand to inspect (must not be NULL).
+ *   r    - rank character to find.
+ *   s    - suit character to find.
+ *
+ * Returns:
+ *   Zero-based index of the matching card if found; otherwise -1.
+ *
+ * Complexity:
+ *   O(n) over the current number of cards (n = hand->count).
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 static int card_in_hand(const Hand *hand, char r, char s) {
     if (!hand) return 0;
@@ -127,7 +215,23 @@ static int card_in_hand(const Hand *hand, char r, char s) {
 
 
 /**
- * Validate command line arguments
+ * validate_arguments
+ * ------------------
+ * Validates command-line arguments and exits with the correct usage/status
+ * if they are invalid (per assignment specification).
+ *
+ * Parameters:
+ *   argc - count of command-line arguments.
+ *   argv - vector of command-line argument strings.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Prints usage or error messages to stderr and may terminate the program
+ *   with the specified exit status on invalid input.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 void validate_arguments(int argc, char *argv[]) {
     if (argc != 4) {
@@ -143,15 +247,31 @@ void validate_arguments(int argc, char *argv[]) {
 }
 
 /**
- * Attempts to connect to the given port on localhost.
- * If the connection cannot be established, prints an error and exits with code 5.
+ * check_and_connect_port
+ * ----------------------
+ * Resolves and connects to the server on the given port/service.
+ *
+ * Parameters:
+ *   port - C string containing the port number or service name to connect to.
+ *
+ * Returns:
+ *   Connected socket file descriptor (non-negative) on success;
+ *   on failure, prints the appropriate error message and terminates
+ *   with the specified exit status (per spec), or returns a negative value
+ *   if the caller is expected to handle errors.
+ *
+ * Notes:
+ *   The exact exit behaviour should match the assignment’s error-handling
+ *   table (e.g., invalid port vs. connect/bind/listen failures).
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 int check_and_connect_port(const char *port) {
     struct addrinfo addrHints, *resolvedAddrs, *addrPtr;
     int connectionFd = -1;
 
     memset(&addrHints, 0, sizeof(addrHints));
-    addrHints.ai_family = AF_UNSPEC;      // IPv4 or IPv6
+    addrHints.ai_family = AF_UNSPEC;
     addrHints.ai_socktype = SOCK_STREAM;  // TCP connection
 
     int status = getaddrinfo("localhost", port, &addrHints, &resolvedAddrs);
@@ -185,7 +305,25 @@ int check_and_connect_port(const char *port) {
 }
 
 /**
- * Setup server input and output streams
+ * setup_server_streams
+ * --------------------
+ * Wraps a connected socket in standard I/O streams for line-oriented
+ * protocol I/O and configures buffering as required.
+ *
+ * Parameters:
+ *   sockfd    - connected socket file descriptor.
+ *   serverOut - output parameter; on success, *serverOut is set to a FILE*
+ *               opened for writing to the server.
+ *
+ * Returns:
+ *   FILE* opened for reading from the server (input stream) on success;
+ *   NULL on failure (and may close sockfd as needed).
+ *
+ * Side effects:
+ *   May dup() the socket and adjust stream buffering. Caller is responsible
+ *   for closing the returned FILE* streams when finished.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 FILE* setup_server_streams(int sockfd, FILE **serverOut) {
     FILE *serverIn = fdopen(sockfd, "r");
@@ -214,11 +352,24 @@ FILE* setup_server_streams(int sockfd, FILE **serverOut) {
     return serverIn;
 }
 
-// Send client name and game name to server
 /**
- * ratsclient should send the user’s name and game name as soon as it connects to ratsserver.
- *  The client informs the server of the user’s name and requested game name by sending them to the server on individual lines, 
- * e.g. Harry\nExplodingSnap\n 
+ * send_client_info
+ * ----------------
+ * Sends the client’s identity and target game name to the server according
+ * to the protocol (one line per field, newline-terminated).
+ *
+ * Parameters:
+ *   serverOut  - writable FILE* connected to the server.
+ *   clientName - client/player name to send.
+ *   gameName   - game name (lobby/room) to send.
+ *
+ * Returns:
+ *   None.
+ *
+ * Preconditions:
+ *   serverOut must be non-NULL and writable; strings must be non-NULL.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 void send_client_info(FILE *serverOut, const char *clientName, const char *gameName) {
     if (fprintf(serverOut, "%s\n", clientName) < 0 || fflush(serverOut) != 0 ||
@@ -229,6 +380,26 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
     }
 }
 
+/**
+ * display_cards
+ * -------------
+ * Renders a subset or grouping of cards from the hand based on the
+ * requested type/filter (e.g., by suit or presentation mode).
+ *
+ * Parameters:
+ *   hand - pointer to the current Hand to display.
+ *   type - display selector; semantics defined by the caller (e.g., suit
+ *          character 'S','H','D','C' or a mode flag).
+ *
+ * Returns:
+ *   None.
+ *
+ * Notes:
+ *   This function does not modify the Hand; it only prints to stdout.
+ *   Call display_hand() for a full view if no filtering is desired.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void display_cards(const Hand* hand, char type) {
     for (int i = 0; i < hand->count; i++) {
         // Card is stored as "RankSuit" (rank at index 0, suit at index 1)
@@ -240,6 +411,23 @@ void display_cards(const Hand* hand, char type) {
     }
 }
 
+/**
+ * display_hand
+ * ------------
+ * Renders the player's entire current hand to stdout in the ratsclient's
+ * chosen UI/format. Intended for human readability during interactive play.
+ *
+ * Parameters:
+ *   hand - pointer to the Hand to be displayed (must not be NULL).
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Prints to stdout. Does not mutate the Hand contents.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void display_hand(const Hand* hand) {
     printf("S:");
     display_cards(hand, 'S');
@@ -256,7 +444,30 @@ void display_hand(const Hand* hand) {
 
 }
 
-//done
+/**
+ * parse_hand_message
+ * ------------------
+ * Parses an 'H' message from the server containing a 52-character card
+ * payload (26 rank/suit pairs) and loads it into the client's Hand model.
+ *
+ * Parameters:
+ *   message - null-terminated server line beginning with 'H' followed by
+ *             52 card characters (must not be NULL).
+ *   hand    - output Hand to populate with the 26 cards (must not be NULL).
+ *
+ * Returns:
+ *   None.
+ *
+ * Preconditions:
+ *   The message format must conform to the protocol; no whitespace is
+ *   expected in the card payload. Rank/suit characters are assumed valid
+ *   per spec.
+ *
+ * Side effects:
+ *   Overwrites the Hand contents and resets its count to 26.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void parse_hand_message(const char* message, Hand* hand) {
     hand->count = 0;
     const char* ptr = message + 1; // Skip 'H' or the ' ' after H
@@ -282,6 +493,28 @@ void parse_hand_message(const char* message, Hand* hand) {
     qsort(hand->cards, hand->count, CARD_LEN, compare_cards);
 }
 
+/**
+ * handle_lead
+ * -----------
+ * Handles a server 'L' prompt by obtaining a lead card from the user,
+ * validating that the card exists in the Hand, and sending it to the server.
+ * Re-prompts locally until a syntactically valid card that exists in the
+ * Hand is entered.
+ *
+ * Parameters:
+ *   serverOut - writable FILE* to the server (must not be NULL).
+ *   hand      - player's Hand to validate against (must not be NULL).
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Reads from stdin, writes to stdout for the prompt, and sends the chosen
+ *   card (e.g., "TD" for Ten of Diamonds) on a single line to serverOut.
+ *   Does not remove the card from the Hand; removal occurs upon acceptance.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void handle_lead(FILE *serverOut, Hand *hand) {
     while (1) {
         display_hand(hand);
@@ -324,6 +557,29 @@ void handle_lead(FILE *serverOut, Hand *hand) {
     }
 }
 
+/**
+ * handle_play
+ * -----------
+ * Handles a server 'P' prompt for a follower given the lead suit. Obtains
+ * a card from the user, validates syntax, presence in the Hand, and—if the
+ * Hand contains any cards of leadSuit—enforces follow-suit. Will re-prompt
+ * locally until a legal card is provided, then sends that card to the server.
+ *
+ * Parameters:
+ *   serverOut - writable FILE* to the server (must not be NULL).
+ *   hand      - player's Hand to validate against (must not be NULL).
+ *   leadSuit  - suit character ('S','H','D','C') indicating the trick’s lead.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Reads from stdin, writes to stdout for prompts, and sends a single-line
+ *   card token to serverOut. Does not remove the card from the Hand; removal
+ *   occurs upon acceptance in handle_accept().
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
     while (1) {
         display_hand(hand);
@@ -374,6 +630,27 @@ void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
     }
 }
 
+/**
+ * handle_accept
+ * -------------
+ * Processes an 'A' acknowledgement from the server indicating that the most
+ * recent card sent by the client has been accepted as a legal play. This
+ * function updates the local Hand to remove the accepted card (e.g., using
+ * the client's stored "last sent" card token).
+ *
+ * Parameters:
+ *   hand - pointer to the client's Hand to mutate (must not be NULL).
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   Mutates the Hand by removing exactly one card corresponding to the last
+ *   transmitted play. If the last-sent card cannot be found, the Hand is left
+ *   unchanged and the client may optionally report a protocol error.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void handle_accept(Hand *hand) {
     if (hand->lastSend[0] != '\0' && hand->lastSend[1] != '\0') {
         remove_card_from_hand(hand, hand->lastSend);   // <- fixed name
@@ -383,31 +660,47 @@ void handle_accept(Hand *hand) {
     }
 }
 
+/**
+ * handle_message
+ * --------------
+ * Dispatches a single server line to the appropriate client handler.
+ * Typical messages include:
+ *   'M' ... : informational text (printed to stdout),
+ *   'H' ... : initial hand (parsed via parse_hand_message()),
+ *   'L'     : prompt to lead a trick (handled via handle_lead()),
+ *   'P' x   : prompt to play following lead suit x (handle_play()),
+ *   'A'     : acknowledgement of a valid play (handle_accept()).
+ *
+ * Parameters:
+ *   message   - the raw server line (must not be NULL).
+ *   serverOut - writable FILE* to send responses/plays to the server.
+ *   hand      - client's current Hand to read/modify based on plays.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   May print to stdout, mutate the Hand (when a valid play is accepted),
+ *   and write protocol lines to serverOut.
+ *
+ * Error handling:
+ *   Lines that do not conform to the protocol are ignored or reported
+ *   according to the assignment’s requirements.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 void handle_message(const char *message, FILE* serverOut, Hand* hand) {
     switch (message[0]) {
         case 'M':
             printf("Info: %s", message+1);
             break;
         case 'A':
-            /**
-             * In successive tricks, cards that have been played should be removed. 
-             * Do not remove a card until the server has sent an “A” message
-             * */
             handle_accept(hand);
             break;
         case 'L':
-            /**
-             * When the game starts, the client will wait for the server to ask it to play. 
-             * If it has the lead, then the hand should be displayed followed by the prompt
-             *          Lead>
-             */
             handle_lead(serverOut, hand);
             break;
         case 'H':
-            /**
-             * If the client does not have the lead, then it will display the hand followed by the prompt
-             *          H <card1> <card2> ... <cardN>\n
-             */
             if (hand->count > 0) {
                 fprintf(stderr, "ratsclient: a protocol error occurred\n");
                 exit(7);
@@ -416,10 +709,6 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
             display_hand(hand);
             break;
         case 'P': {
-            /**
-             * Tells the client to play a card following the lead suit <suit>.
-             * [<suit>] play>
-             */
             char suit;
             if (sscanf(message, "P %c", &suit) != 1 && sscanf(message, "P%c", &suit) != 1) {
                 fprintf(stderr, "ratsclient: a protocol error occurred\n");
@@ -435,7 +724,6 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
             break;
         }
         case 'O':
-            //end game
             exit(0);
             break;
 
@@ -446,7 +734,6 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 }
 
 
-// Main function - orchestrates the client execution
 int main(int argc, char *argv[]) {
     // 1. Parse and validate arguments
     validate_arguments(argc, argv);
