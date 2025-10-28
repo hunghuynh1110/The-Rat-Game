@@ -36,7 +36,9 @@ void handle_accept(Hand *hand);
 int get_rank_value(char rank);
 int get_suit_value(char suit);
 int compare_cards(const void *a, const void *b);
+
 static void remove_card_from_hand(Hand *hand, const char rs[3]);
+static int card_in_hand(const Hand *hand, char r, char s);
 
 
 
@@ -110,8 +112,23 @@ static void remove_card_from_hand(Hand *hand, const char rs[3]) {
     }
 }
 
+/**
+ * Returns 1 if the exact (rank,suit) exists in the hand without mutating it, else 0.
+ */
+static int card_in_hand(const Hand *hand, char r, char s) {
+    if (!hand) return 0;
+    for (int i = 0; i < hand->count; ++i) {
+        if (hand->cards[i][0] == r && hand->cards[i][1] == s) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
-// Validate command line arguments
+
+/**
+ * Validate command line arguments
+ */
 void validate_arguments(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: ./ratsclient clientname game port\n");
@@ -167,7 +184,9 @@ int check_and_connect_port(const char *port) {
     return connectionFd;
 }
 
-// Setup server input and output streams
+/**
+ * Setup server input and output streams
+ */
 FILE* setup_server_streams(int sockfd, FILE **serverOut) {
     FILE *serverIn = fdopen(sockfd, "r");
     if (!serverIn) {
@@ -264,54 +283,95 @@ void parse_hand_message(const char* message, Hand* hand) {
 }
 
 void handle_lead(FILE *serverOut, Hand *hand) {
-    display_hand(hand);
-    printf("Lead> ");
-    fflush(stdout);
+    while (1) {
+        display_hand(hand);
+        printf("Lead> ");
+        fflush(stdout);
 
-    char input[16];
-    if (fgets(input, sizeof(input), stdin) == NULL) {
-        fprintf(stderr, "ratsclient: user has quit\n");
-        exit(17);
-    }
+        char buf[16];
+        if (!fgets(buf, sizeof buf, stdin)) {
+            fprintf(stderr, "ratsclient: user has quit\n");
+            exit(17);
+        }
+        buf[strcspn(buf, "\r\n")] = '\0';
 
-    input[strcspn(input, "\n")] = '\0';
+        if (strlen(buf) != 2) {
+            continue; // re-prompt; do not talk to server
+        }
 
-    // Capture the first token and remember first two chars as the card we intend
-    char token[8] = {0};
-    if (sscanf(input, " %7s", token) == 1 && strlen(token) >= 2) {
-        hand->lastSend[0] = token[0];
-        hand->lastSend[1] = token[1];
+        char r = buf[0];
+        char s = buf[1];
+
+        // Validate characters
+        if (get_rank_value(r) == 0) {
+            continue;
+        }
+        if (get_suit_value(s) > 3) { // invalid suit
+            continue;
+        }
+        // Must exist in hand (leader has no follow-suit restriction)
+        if (!card_in_hand(hand, r, s)) {
+            continue;
+        }
+
+        // Send once valid
+        fprintf(serverOut, "%c%c\n", r, s);
+        fflush(serverOut);
+        hand->lastSend[0] = r;
+        hand->lastSend[1] = s;
         hand->lastSend[2] = '\0';
-        fprintf(serverOut, "%s\n", token);
-    } else {
-        hand->lastSend[0] = '\0';
-        fprintf(serverOut, "%s\n", input);
+        return;
     }
-    fflush(serverOut);
-
 }
 
 void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
-    display_hand(hand);
-    printf("[%c] play> ", leadSuit);
-    fflush(stdout);
+    while (1) {
+        display_hand(hand);
+        printf("[%c] play> ", leadSuit);
+        fflush(stdout);
 
-    char card[10];
-    if (fgets(card, sizeof(card), stdin) == NULL) {
-        fprintf(stderr, "ratsclient: user has quit\n");
-        exit(17);
-    }
+        char buf[16];
+        if (!fgets(buf, sizeof buf, stdin)) {
+            fprintf(stderr, "ratsclient: user has quit\n");
+            exit(17);
+        }
+        buf[strcspn(buf, "\r\n")] = '\0';
 
-    card[strcspn(card, "\n")] = '\0';
-    if (strlen(card) >= 2) {
-        hand->lastSend[0] = card[0];
-        hand->lastSend[1] = card[1];
+        if (strlen(buf) != 2) {
+            continue; // re-prompt; do not talk to server
+        }
+
+        char r = buf[0];
+        char s = buf[1];
+
+        // Validate characters
+        if (get_rank_value(r) == 0) {
+            continue;
+        }
+        if (get_suit_value(s) > 3) { // invalid suit
+            continue;
+        }
+        // Must exist in the hand
+        if (!card_in_hand(hand, r, s)) {
+            continue;
+        }
+        // If we have any of the lead suit, the chosen card must match leadSuit
+        int haveLead = 0;
+        for (int i = 0; i < hand->count; ++i) {
+            if (hand->cards[i][1] == leadSuit) { haveLead = 1; break; }
+        }
+        if (haveLead && s != leadSuit) {
+            continue;
+        }
+
+        // Send once valid
+        fprintf(serverOut, "%c%c\n", r, s);
+        fflush(serverOut);
+        hand->lastSend[0] = r;
+        hand->lastSend[1] = s;
         hand->lastSend[2] = '\0';
-    } else {
-        hand->lastSend[0] = hand->lastSend[1] = hand->lastSend[2] = '\0';
+        return;
     }
-    fprintf(serverOut, "%s\n", card);
-    fflush(serverOut);
 }
 
 void handle_accept(Hand *hand) {
@@ -348,6 +408,10 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
              * If the client does not have the lead, then it will display the hand followed by the prompt
              *          H <card1> <card2> ... <cardN>\n
              */
+            if (hand->count > 0) {
+                fprintf(stderr, "ratsclient: a protocol error occurred\n");
+                exit(7);
+            }
             parse_hand_message(message, hand);
             display_hand(hand);
             break;
@@ -386,6 +450,9 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 int main(int argc, char *argv[]) {
     // 1. Parse and validate arguments
     validate_arguments(argc, argv);
+    // Ensure prompts/lines appear immediately when stdout is piped by tests
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     char *clientName = argv[1];
     char *gameName   = argv[2];
     char *port       = argv[3];
