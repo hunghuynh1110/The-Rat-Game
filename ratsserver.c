@@ -15,7 +15,10 @@
 
 #include <signal.h>
 #include <pthread.h>
-
+#include <stdarg.h>
+#include <stdint.h>
+#include <time.h>
+#include "/local/courses/csse2310/include/csse2310a4.h"
 
 typedef struct ServerContext ServerContext; // forward-declare for pointer usage
 typedef struct {
@@ -61,6 +64,12 @@ static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, cons
 static int handle_client_join(ServerContext *serverCtx, int clientFd, 
     FILE *inStream, char **playerNameOut, Game **gameOut);
 static void unlink_pending_game(ServerContext* serverCtx, Game* target);
+
+static void start_game(ServerContext *serverCtx, Game *target);
+static void broadcast_msg(FILE *outs[4], const char *fmt, ...);
+static void deal_and_send_hands(FILE *outs[4], const char *deckStr);
+
+
 
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
@@ -129,7 +138,7 @@ static int listen_and_report_port(const char* portMsg, const char* service) {
     }
     freeaddrinfo(res);
 
-    // if none workk
+    // if none work
     if(lfd < 0) {
         fprintf(stderr, "ratsserver: unable to listen on given port \"%s\"\n", portMsg);
         exit(6);
@@ -196,14 +205,16 @@ static void* client_greeting_thread(void* threadArg) {
         return NULL;
     }
 
-    // TODO: start_game(serverCtx, game);
+    // seatIndex == 3 -> game just became full; prevent further joins on this game.
+    unlink_pending_game(serverCtx, game);
+    // TODO: 
+    start_game(serverCtx, game);
 
     free(clientArg);
     return NULL;
 }
 
 
-// main server loop that accepts clients and hands each to a detached thread that sends the greeting.
 static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx) {
     while(true) {
         struct sockaddr_in clientAddr;
@@ -358,8 +369,8 @@ static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, cons
     return seatIndex;
 }
 
-static int handle_client_join(ServerContext *serverCtx, int clientFd, 
-    FILE *inStream, char **playerNameOut, Game **gameOut) {
+static int handle_client_join(ServerContext *serverCtx, int clientFd
+        ,FILE *inStream, char **playerNameOut, Game **gameOut) {
         if(!serverCtx || clientFd<0 || !inStream || !playerNameOut || !gameOut) {
             return -1;
         }
@@ -409,6 +420,87 @@ static void unlink_pending_game(ServerContext* serverCtx, Game* target) {
         cursor = &(*cursor)->next;
     }
     pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+}
+
+static void broadcast_msg(FILE *outs[4], const char *fmt, ...) {
+    if (!outs || !fmt) {
+        return;
+    }
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (!outs[i]) {
+            continue;
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(outs[i], fmt, ap);
+        va_end(ap);
+        fflush(outs[i]);
+    }
+}
+
+static void deal_and_send_hands(FILE *outs[4], const char *deckStr) {
+    if(!deckStr) {
+        return;
+    }
+    char hand[27];
+    hand[26] = '\0';
+    char line[32];
+    for (int p = 0; p < MAX_PLAYERS; ++p) {
+        int k = 0;
+        for (int i = p * 2; i < 104 && k < 26; i+=8) {
+            hand[k++] = deckStr[i];
+            hand[k++] = deckStr[i + 1];
+        }
+
+        if(outs[p]) {
+            snprintf(line, sizeof line, "H%.*s", 26, hand);
+            fputs(line, outs[p]);
+            fputc('\n', outs[p]);
+            fflush(outs[p]);
+        }
+    }
+}
+
+static void start_game(ServerContext* serverCtx, Game* game) {
+    (void)serverCtx;
+
+    FILE *outs[4] = {0};
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if(game->playerFds[i] >= 0) {
+            outs[i] = fdopen(dup(game->playerFds[i]), "w");
+        }
+    }
+
+    //announce team
+    char team1Msg[512], team2Msg[512];
+    snprintf(team1Msg, sizeof team1Msg, "MTeam 1: %s, %s\n",
+             game->playerNames[0] ? game->playerNames[0] : "P1",
+             game->playerNames[2] ? game->playerNames[2] : "P3");
+    snprintf(team2Msg, sizeof team2Msg, "MTeam 2: %s, %s\n",
+             game->playerNames[1] ? game->playerNames[1] : "P2",
+             game->playerNames[3] ? game->playerNames[3] : "P4");
+
+    for (int i = 0; i < MAX_PLAYERS;++i) {
+        if(outs[i]) {
+            fputs(team1Msg, outs[i]);
+            fputs(team2Msg, outs[i]);
+            fflush(outs[i]);
+        }
+    }
+
+    const char *deckStr = get_random_deck();
+    deal_and_send_hands(outs, deckStr);
+
+
+    //announce start
+    broadcast_msg(outs, "MStarting the game\n");
+
+    //close write streams
+    for (int i = 0; i < MAX_PLAYERS;++i) {
+        if(outs[i]) {
+            fclose(outs[i]);
+        }
+    }
 }
 
 int main(int argc, char** argv) {

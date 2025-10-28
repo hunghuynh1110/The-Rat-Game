@@ -11,3 +11,31 @@ ratsserver: ratsserver.o protocol.o
 
 clean:
 	rm -f *.o ratsclient ratsserver
+
+CC      = gcc
+CFLAGS  = -Wall -Wextra -pedantic -std=gnu99 -pthread
+MOSS_LIB = /local/courses/csse2310/lib
+
+# Link flags & libs for ratsserver only
+LDFLAGS_SERVER = -L$(MOSS_LIB) -Wl,-rpath,$(MOSS_LIB)
+LDLIBS_SERVER  = -lcsse2310a4
+
+OBJS_CLIENT = ratsclient.o protocol.o
+OBJS_SERVER = ratsserver.o protocol.o
+
+.PHONY: all clean
+
+all: ratsclient ratsserver
+
+ratsclient: $(OBJS_CLIENT)
+	$(CC) $(CFLAGS) -o $@ $(OBJS_CLIENT)
+
+ratsserver: $(OBJS_SERVER)
+	$(CC) $(CFLAGS) $(LDFLAGS_SERVER) -o $@ $(OBJS_SERVER) $(LDLIBS_SERVER)
+
+# Generic compile rule
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f *.o ratsclient ratsserver
