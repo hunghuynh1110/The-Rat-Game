@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <time.h>
 #include "/local/courses/csse2310/include/csse2310a4.h"
+#include <stdatomic.h>
+#include <poll.h>
 
 typedef struct ServerContext ServerContext; // forward-declare for pointer usage
 typedef struct {
@@ -48,9 +50,13 @@ struct ServerContext {
     unsigned activeClients;
     pthread_cond_t canAccept;
 
-    unsigned long totalThreadsCreated;
-    unsigned long activeClientThreads;
-    unsigned long activeSockets;
+    // Statistics
+    atomic_uint totalPlayersConnected;
+    atomic_uint gamesRunning;
+    atomic_uint gamesCompleted;
+    atomic_uint gamesTerminated;
+    atomic_uint totalTricksPlayed;
+    atomic_uint activeClientSockets;
 };
 
 // Server-side hand representation for each player (no globals; passed down)
@@ -95,15 +101,19 @@ static bool remove_card_from_hand(PlayerHand *hand, char rankChar, char suitChar
 
 
 static bool parse_card_token(const char *line, char *rankOut, char *suitOut);
-static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4], PlayerHand hands[4]);
+static int play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4], PlayerHand hands[4]);
 
 static void announce_play(FILE *outs[4], const Game* game, int seat, char rankChar, char suitChar);
 static void announce_trick_winner(FILE *outs[4], const Game* game, int winnerSeat);
 static int seat_to_team(int seat);
 static void announce_final_score(FILE *outs[4], int team1Tricks, int team2Tricks);
 
+
 //SIGHUP
-static void *hup_stats_thread(void *arg);
+static void *stats_sigwait_thread(void *arg);
+static void start_sighup_stats_thread(ServerContext *ctx);
+static void *pending_fd_monitor_thread(void *arg);
+static void start_pending_fd_monitor(ServerContext *ctx);
 
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
@@ -192,13 +202,14 @@ static int listen_and_report_port(const char* portMsg, const char* service) {
 
 }
 
-static void block_sigpipe_all_threads(void) {
+static void block_sigpipe_all_threads(void)
+{
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
-    sigaddset(&set, SIGHUP);  // block SIGHUP so a helper thread sigwaits
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 }
+
 
 /**
  * Per new connection:
@@ -211,8 +222,7 @@ static void* client_greeting_thread(void* threadArg) {
     ClientArg* clientArg = (ClientArg*)threadArg;
     int clientFd = clientArg->fd;
     const char* greetingMessage = clientArg->greeting;
-    ServerContext* serverCtx = clientArg->serverCtx;
-    pthread_detach(pthread_self());  // prevent zombie threads
+    ServerContext *serverCtx = clientArg->serverCtx;
 
     FILE* clientOut = fdopen(dup(clientFd), "w");
     if (clientOut) {
@@ -224,87 +234,75 @@ static void* client_greeting_thread(void* threadArg) {
     FILE* clientIn = fdopen(dup(clientFd), "r");
     if (!clientIn) {
         close(clientFd);
+        atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
         release_conn_slot(serverCtx);
         free(clientArg);
-        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
-        serverCtx->activeClientThreads--;
-        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
-    char* playerName = NULL;
-    Game* game = NULL;
+    char *playerName = NULL;
+    Game *game = NULL;
+
     int seatIndex = handle_client_join(serverCtx, clientFd, clientIn, &playerName, &game);
     fclose(clientIn);
 
     if (seatIndex < 0) {
         close(clientFd);
+        atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
         release_conn_slot(serverCtx);
         free(playerName);
         free(clientArg);
-        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
-        serverCtx->activeClientThreads--;
-        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
     free(playerName);
 
-    if (seatIndex < MAX_PLAYERS - 1) {
-        close(clientFd);
+    //check if full
+    if (seatIndex < (MAX_PLAYERS - 1)) {
         free(clientArg);
-        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
-        serverCtx->activeClientThreads--;
-        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
+    // seatIndex == 3 -> game just became full; prevent further joins on this game.
     unlink_pending_game(serverCtx, game);
+    // TODO: 
     start_game(serverCtx, game);
-    close(clientFd);
     free(clientArg);
-
-    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
-    serverCtx->activeClientThreads--;
-    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
-
     return NULL;
 }
 
+
+/* #9: accept_loop — no goto */
 static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx) {
     for (;;) {
-        // Reserve a slot before accepting so we don't hold extra accepted sockets
-        // beyond the configured connection limit.
         acquire_conn_slot(serverCtx);
 
         int clientFd = -1;
-        bool retryOuter = false;
+        bool restartOuter = false;
 
-        // Accept loop: retry on EINTR; on other errors, release slot and restart outer loop.
-        while (1) {
+        for (;;) {
             struct sockaddr_in clientAddr;
             socklen_t clientLen = sizeof clientAddr;
             clientFd = accept(listenFd, (struct sockaddr *)&clientAddr, &clientLen);
-            if (clientFd >= 0) {
-                break; // got one
-            }
-            if (errno == EINTR) {
-                continue; // keep the reserved slot and retry accept
-            }
-            // Any other error: free the reserved slot and restart the outer loop.
+            if (clientFd >= 0) break;
+            if (errno == EINTR) continue;
+            // Other errors: free slot and try the outer loop again
             release_conn_slot(serverCtx);
-            retryOuter = true;
+            restartOuter = true;
             break;
         }
-        if (retryOuter) {
-            continue; // no goto needed
-        }
+        if (restartOuter) continue;
 
-        // Build per-client argument
+        // NEW: count this accepted socket as a connected player,
+        // and bump the cumulative total-players metric.
+        atomic_fetch_add(&serverCtx->activeClientSockets, 1u);
+        atomic_fetch_add(&serverCtx->totalPlayersConnected, 1u);
+
         ClientArg *clientArg = malloc(sizeof *clientArg);
         if (!clientArg) {
-            // Cannot service this client; close and free the reserved slot.
             close(clientFd);
+            // undo the live-socket bump
+            atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
             release_conn_slot(serverCtx);
             continue;
         }
@@ -314,18 +312,14 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
 
         pthread_t threadId;
         if (pthread_create(&threadId, NULL, client_greeting_thread, clientArg) != 0) {
-            // Thread could not be created; close and release the reserved slot.
             close(clientFd);
+            // undo the live-socket bump
+            atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
             release_conn_slot(serverCtx);
             free(clientArg);
             continue;
         }
         pthread_detach(threadId);
-
-        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
-        serverCtx->totalThreadsCreated++;
-        serverCtx->activeClientThreads++;
-        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
     }
 }
 
@@ -449,6 +443,7 @@ static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, cons
     }
 
     game->playerCount++;
+    // NOTE: Do NOT bump totalPlayersConnected here; it represents accepted sockets.
 
     pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
     return seatIndex;
@@ -785,51 +780,50 @@ static void announce_final_score(FILE *outs[4], int team1Tricks, int team2Tricks
     }
 }
 
-static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4], PlayerHand hands[4]) {
-    (void)serverCtx;
+/* #7: play_tricks — return 0 if game completed, 1 if terminated early */
+static int play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4], PlayerHand hands[4]) {
     (void)game;
 
     int teamTricks[2] = {0, 0};
-
     int leaderSeat = 0;
+
     for (int trick = 0; trick < 13; ++trick) {
         char plays[4][2] = {{0}};
         char leadSuit = 0;
 
         for (int offset = 0; offset < MAX_PLAYERS; ++offset) {
             int seat = (leaderSeat + offset) % MAX_PLAYERS;
-            if(offset == 0) {
+
+            if (offset == 0) {
                 send_line(outs[seat], "L");
             } else {
                 char prompt[3] = { 'P', leadSuit, '\0' };
                 send_line(outs[seat], prompt);
             }
 
-            while(true) {
+            for (;;) {
                 char *line = read_line_alloc(ins[seat]);
                 if (!line) {
-                    // Current player disconnected: announce to others and end game.
+                    // Seat disconnected: tell others and end the game as terminated.
                     char label[3] = { 'P', (char)('1' + seat), '\0' };
                     for (int j = 0; j < MAX_PLAYERS; ++j) {
-                        if (j == seat || !outs[j]) {
-                            continue; // do not write to the disconnected seat
-                        }
+                        if (j == seat || !outs[j]) continue;
                         fprintf(outs[j], "M%s disconnected early\n", label);
                         fputs("O\n", outs[j]);
                         fflush(outs[j]);
                     }
-                    return;
+                    atomic_fetch_add(&serverCtx->gamesTerminated, 1u);
+                    return 1; // terminated
                 }
 
                 char r, s;
                 bool ok = parse_card_token(line, &r, &s);
                 free(line);
+
                 if (!ok) {
                     if (offset == 0) {
-                        // Leader invalid: re-prompt with 'L' only (no 'I')
                         send_line(outs[seat], "L");
                     } else {
-                        // Follower invalid: 'I' then 'P<leadSuit>'
                         send_line(outs[seat], "I");
                         char rePrompt[3] = { 'P', leadSuit, '\0' };
                         send_line(outs[seat], rePrompt);
@@ -837,23 +831,19 @@ static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE
                     continue;
                 }
 
-                // Enforce "in hand" and "must follow suit if possible"
-                if (offset > 0) {
-                    // Followers must play leadSuit if they have it
-                    if (has_suit_in_hand(&hands[seat], leadSuit) && s != leadSuit) {
-                        send_line(outs[seat], "I");
-                        char rePrompt[3] = { 'P', leadSuit, '\0' };
-                        send_line(outs[seat], rePrompt);
-                        continue;
-                    }
+                // Must follow suit if possible (for followers)
+                if (offset > 0 && has_suit_in_hand(&hands[seat], leadSuit) && s != leadSuit) {
+                    send_line(outs[seat], "I");
+                    char rePrompt[3] = { 'P', leadSuit, '\0' };
+                    send_line(outs[seat], rePrompt);
+                    continue;
                 }
-                // The card must exist in the player's hand
+
+                // Card must exist in player's hand
                 if (!remove_card_from_hand(&hands[seat], r, s)) {
                     if (offset == 0) {
-                        // Leader invalid: re-prompt with 'L' only
                         send_line(outs[seat], "L");
                     } else {
-                        // Follower invalid: 'I' then 'P<leadSuit>'
                         send_line(outs[seat], "I");
                         char rePrompt[3] = { 'P', leadSuit, '\0' };
                         send_line(outs[seat], rePrompt);
@@ -876,57 +866,48 @@ static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE
         int winnerSeat = (leaderSeat + winOffset) % MAX_PLAYERS;
         announce_trick_winner(outs, game, winnerSeat);
         teamTricks[seat_to_team(winnerSeat)]++;
+        atomic_fetch_add(&serverCtx->totalTricksPlayed, 1u);
         leaderSeat = winnerSeat;
     }
 
     announce_final_score(outs, teamTricks[0], teamTricks[1]);
 
-    //game over + notify
+    // Game over: send O to all
     for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if(outs[i]) {
+        if (outs[i]) {
             fputs("O\n", outs[i]);
             fflush(outs[i]);
         }
     }
+    return 0; // completed normally
 }
 
-static void start_game(ServerContext* serverCtx, Game* game) {
 
-    // --- Reseat players by alphabetical name so seats 0..3 are sorted lexicographically ---
+/* #8: start_game — bump gamesRunning/completed around play_tricks */
+static void start_game(ServerContext* serverCtx, Game* game) {
+    // Reseat by alphabetical player name so seats 0..3 are lexicographic
     int order[4] = {0, 1, 2, 3};
-    // simple stable-ish sort by names; null names sort last
     for (int i = 0; i < 4; ++i) {
         for (int j = i + 1; j < 4; ++j) {
             const char *ai = game->playerNames[ order[i] ];
             const char *aj = game->playerNames[ order[j] ];
             int cmp;
-            if (ai && aj) {
-                cmp = strcmp(ai, aj);
-            } else if (ai && !aj) {
-                cmp = -1; // ai first
-            } else if (!ai && aj) {
-                cmp = 1;  // aj first
-            } else {
-                cmp = 0;
-            }
-            if (cmp > 0) {
-                int tmp = order[i];
-                order[i] = order[j];
-                order[j] = tmp;
-            }
+            if (ai && aj)       cmp = strcmp(ai, aj);
+            else if (ai && !aj) cmp = -1;
+            else if (!ai && aj) cmp = 1;
+            else                cmp = 0;
+            if (cmp > 0) { int t = order[i]; order[i] = order[j]; order[j] = t; }
         }
     }
-
-    // Build seat-ordered arrays and copy back into game (so index == seat)
-    int newFds[4] = {-1, -1, -1, -1};
+    int newFds[4]     = {-1, -1, -1, -1};
     char *newNames[4] = {NULL, NULL, NULL, NULL};
     for (int s = 0; s < 4; ++s) {
         int idx = order[s];
-        newFds[s] = game->playerFds[idx];
+        newFds[s]   = game->playerFds[idx];
         newNames[s] = game->playerNames[idx];
     }
     for (int s = 0; s < 4; ++s) {
-        game->playerFds[s] = newFds[s];
+        game->playerFds[s]   = newFds[s];
         game->playerNames[s] = newNames[s];
     }
 
@@ -934,13 +915,11 @@ static void start_game(ServerContext* serverCtx, Game* game) {
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         if (game->playerFds[i] >= 0) {
             outs[i] = fdopen(dup(game->playerFds[i]), "w");
-            if (outs[i]) {
-                setvbuf(outs[i], NULL, _IOLBF, 0); // line-buffered to avoid timeouts in harness
-            }
+            if (outs[i]) setvbuf(outs[i], NULL, _IOLBF, 0);
         }
     }
 
-    //announce team
+    // Announce teams
     char team1Msg[512], team2Msg[512];
     snprintf(team1Msg, sizeof team1Msg, "MTeam 1: %s, %s\n",
              game->playerNames[0] ? game->playerNames[0] : "P1",
@@ -948,26 +927,18 @@ static void start_game(ServerContext* serverCtx, Game* game) {
     snprintf(team2Msg, sizeof team2Msg, "MTeam 2: %s, %s\n",
              game->playerNames[1] ? game->playerNames[1] : "P2",
              game->playerNames[3] ? game->playerNames[3] : "P4");
-
-    for (int i = 0; i < MAX_PLAYERS;++i) {
-        if(outs[i]) {
-            fputs(team1Msg, outs[i]);
-            fputs(team2Msg, outs[i]);
-            fflush(outs[i]);
-        }
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (outs[i]) { fputs(team1Msg, outs[i]); fputs(team2Msg, outs[i]); fflush(outs[i]); }
     }
 
     const char *deckStr = get_deck_or_die();
     deal_and_send_hands(outs, deckStr);
 
-    // Build server-side hands to validate plays
     PlayerHand hands[4];
     build_hands_from_deck(deckStr, hands);
 
-    // announce start
     broadcast_msg(outs, "MStarting the game\n");
 
-    // open read streams
     FILE *ins[4] = {0};
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         if (game->playerFds[i] >= 0) {
@@ -975,82 +946,135 @@ static void start_game(ServerContext* serverCtx, Game* game) {
         }
     }
 
-    // request valid card from leader
-    play_tricks(serverCtx, game, ins, outs, hands);
-
-
-
-    // close write streams
-    for (int i = 0; i < MAX_PLAYERS; ++i)
-    {
-        if (ins[i])
-        {
-            fclose(ins[i]);
-        }
-        if (outs[i])
-        {
-            fclose(outs[i]);
-        }
+    atomic_fetch_add(&serverCtx->gamesRunning, 1u);
+    int ended = play_tricks(serverCtx, game, ins, outs, hands);
+    atomic_fetch_sub(&serverCtx->gamesRunning, 1u);
+    if (ended == 0) {
+        atomic_fetch_add(&serverCtx->gamesCompleted, 1u);
     }
 
-    // Close original sockets and free game resources
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (ins[i])  fclose(ins[i]);
+        if (outs[i]) fclose(outs[i]);
+    }
+
+    // Close original sockets and free names (decrement live count per socket)
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         if (game->playerFds[i] >= 0) {
             close(game->playerFds[i]);
+            atomic_fetch_sub(&serverCtx->activeClientSockets, 1u); // NEW
             game->playerFds[i] = -1;
         }
         free(game->playerNames[i]);
         game->playerNames[i] = NULL;
     }
 
+    // Free connection-limit slots for those 4 players
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         release_conn_slot(serverCtx);
     }
     free(game);
 }
 
-//SIGHUP
-static void *hup_stats_thread(void *arg) {
+static void *stats_sigwait_thread(void *arg) {
     ServerContext *ctx = (ServerContext *)arg;
-
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGHUP);
-
     for (;;) {
-        int sig = 0;
-        if (sigwait(&set, &sig) != 0) continue;
-        if (sig == SIGHUP) {
-            pthread_mutex_lock(&ctx->pendingGamesMutex);
-            unsigned long total   = ctx->totalThreadsCreated;
-            unsigned long activeT = ctx->activeClientThreads;
-            unsigned long activeS = ctx->activeSockets;
-            pthread_mutex_unlock(&ctx->pendingGamesMutex);
+        int sig;
+        if (sigwait(&set, &sig) == 0 && sig == SIGHUP) {
+            unsigned connectedNow = atomic_load(&ctx->activeClientSockets);
 
-            fprintf(stderr, "Total threads created since listen\n%lu\n", total);
-            fprintf(stderr, "Active client threads\n%lu\n", activeT);
-            fprintf(stderr, "Active client sockets\n%lu\n", activeS);
-            fflush(stderr);
+            unsigned tot    = atomic_load(&ctx->totalPlayersConnected);
+            unsigned running= atomic_load(&ctx->gamesRunning);
+            unsigned done   = atomic_load(&ctx->gamesCompleted);
+            unsigned term   = atomic_load(&ctx->gamesTerminated);
+            unsigned tricks = atomic_load(&ctx->totalTricksPlayed);
+
+            char buf[256];
+            int n = snprintf(buf, sizeof buf,
+                "Connected players: %u\n"
+                "Total num players connected: %u\n"
+                "Num games running: %u\n"
+                "Games completed: %u\n"
+                "Games terminated: %u\n"
+                "Total tricks played: %u\n",
+                connectedNow, tot, running, done, term, tricks);
+            if (n > 0) { (void)write(STDERR_FILENO, buf, (size_t)n); }
         }
     }
     return NULL;
 }
+
+static void start_sighup_stats_thread(ServerContext *ctx) {
+    // Block SIGHUP in all threads; the dedicated thread will sigwait()
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+    pthread_t tid;
+    (void)pthread_create(&tid, NULL, stats_sigwait_thread, ctx);
+    (void)pthread_detach(tid);
+}
+
+// Monitor pending-game sockets so disconnects free slots & don’t skew stats
+static void *pending_fd_monitor_thread(void *arg) {
+    ServerContext *ctx = (ServerContext *)arg;
+    for (;;) {
+        pthread_mutex_lock(&ctx->pendingGamesMutex);
+        for (Game *g = ctx->pendingGamesHead; g; g = g->next) {
+            int pc = g->playerCount;
+            for (int s = 0; s < pc; ++s) {
+                int fd = g->playerFds[s];
+                if (fd < 0) continue;
+                struct pollfd pfd = { .fd = fd, .events = 0, .revents = 0 };
+                int r = poll(&pfd, 1, 0);
+                if (r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                    // Remove this pending player and compact arrays
+                    close(fd);
+                    atomic_fetch_sub(&ctx->activeClientSockets, 1u);   // NEW: keep live count correct
+                    if (g->playerNames[s]) { free(g->playerNames[s]); g->playerNames[s] = NULL; }
+                    for (int t = s + 1; t < pc; ++t) {
+                        g->playerFds[t - 1]   = g->playerFds[t];
+                        g->playerNames[t - 1] = g->playerNames[t];
+                    }
+                    g->playerFds[pc - 1] = -1;
+                    g->playerNames[pc - 1] = NULL;
+                    g->playerCount--;
+                    if (ctx->activeClients > 0) { ctx->activeClients--; }
+                    pthread_cond_signal(&ctx->canAccept);
+                    pc = g->playerCount;
+                    s--; // re-check current index after compaction
+                }
+            }
+        }
+        pthread_mutex_unlock(&ctx->pendingGamesMutex);
+        (void)poll(NULL, 0, 100); // 100ms sleep via poll (no prohibited nanosleep/usleep)
+    }
+    return NULL;
+}
+
+static void start_pending_fd_monitor(ServerContext *ctx) {
+    pthread_t tid;
+    (void)pthread_create(&tid, NULL, pending_fd_monitor_thread, ctx);
+    (void)pthread_detach(tid);
+}
+
+/* #10: main — init atomics and start SIGHUP/pending monitors before serving */
 int main(int argc, char** argv) {
-    // Usage checking: only shape/emptiness here
+    // Usage checking
     if (argc != 3 && argc != 4) {
         die_usage();
     }
-
     unsigned maxconnsValue = 0;
     if (!parse_maxconns(argv[1], &maxconnsValue)) {
         die_usage();
     }
-
     const char* greeting = argv[2];
     if (!*greeting) {
         die_usage();
     }
-
     const char* portArg = (argc == 4) ? argv[3] : "0";
     if (argc == 4 && !*portArg) {
         die_usage();
@@ -1059,10 +1083,10 @@ int main(int argc, char** argv) {
     // Block SIGPIPE so writes to closed sockets don't kill the process
     block_sigpipe_all_threads();
 
-    // Validate/bind/listen on the port; prints actual bound port to stderr
+    // Bind/listen; prints bound port to stderr
     int listenFd = listen_and_report_port(portArg, portArg);
 
-    // Initialize shared server context (no globals)
+    // Shared server context
     ServerContext serverCtx;
     serverCtx.pendingGamesHead = NULL;
     pthread_mutex_init(&serverCtx.pendingGamesMutex, NULL);
@@ -1070,16 +1094,20 @@ int main(int argc, char** argv) {
     serverCtx.activeClients = 0;
     pthread_cond_init(&serverCtx.canAccept, NULL);
 
-    serverCtx.totalThreadsCreated = 0;
-    serverCtx.activeClientThreads = 0;
-    serverCtx.activeSockets = 0;
+    // Init stats
+    atomic_init(&serverCtx.totalPlayersConnected, 0);
+    atomic_init(&serverCtx.gamesRunning,        0);
+    atomic_init(&serverCtx.gamesCompleted,      0);
+    atomic_init(&serverCtx.gamesTerminated,     0);
+    atomic_init(&serverCtx.totalTricksPlayed,   0);
+    atomic_init(&serverCtx.activeClientSockets, 0);
 
-    pthread_t hupThread;
-    if (pthread_create(&hupThread, NULL, hup_stats_thread, &serverCtx) == 0) {
-        pthread_detach(hupThread);
-    }
+    // Start SIGHUP stats thread + pending-FD monitor
+    start_sighup_stats_thread(&serverCtx);
+    start_pending_fd_monitor(&serverCtx);
 
     // Serve forever
     accept_loop(listenFd, greeting, &serverCtx);
     return 0;
 }
+
