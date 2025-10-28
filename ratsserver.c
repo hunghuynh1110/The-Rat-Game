@@ -152,6 +152,16 @@ static int play_single_trick(ServerContext *serverCtx, Game *game,
                              FILE *ins[MAX_PLAYERS], FILE *outs[MAX_PLAYERS],
                              PlayerHand hands[MAX_PLAYERS],
                              int leaderSeat, int *winnerSeatOut);
+static void send_lead_or_play_prompt(FILE *out, bool isLeader, char leadSuit);
+static void send_invalid_and_reprompt(FILE *out, bool isLeader, char leadSuit);
+
+static void reseat_players_lex(Game *game);
+static void setup_streams_deal_and_announce(
+    Game *game, FILE *ins[], FILE *outs[],
+    PlayerHand hands[], const char **pDeckStr);
+static void run_game_and_cleanup(ServerContext *serverCtx, Game *game,
+                                 FILE *ins[], FILE *outs[],
+                                 PlayerHand hands[]);
 
 // SIGHUP
 static void *stats_sigwait_thread(void *arg);
@@ -173,7 +183,8 @@ static void start_pending_fd_monitor(ServerContext *ctx);
  *
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
-static void die_usage(void) {
+static void die_usage(void)
+{
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
     exit(INVALID_ARG);
 }
@@ -1224,7 +1235,33 @@ static void send_invalid_and_reprompt(FILE* out, bool isLeader, char leadSuit) {
     }
 }
 
-// --- helper: announce early disconnect & terminate game (≈ 30 LOC) ---
+/**
+ * handle_disconnect_early
+ * -----------------------
+ * Handles a player disconnect/EOF/forfeit detected before a trick (or during
+ * the player's turn) has been legally completed. Performs any required
+ * notifications to other players, records statistics if applicable, and
+ * returns a non-zero status to unwind the play loop cleanly.
+ *
+ * Parameters:
+ *   serverCtx - pointer to ServerContext (atomics, limits).
+ *   game      - current Game (for names/seats when notifying others).
+ *   seat      - seat index [0..3] of the player who disconnected/forfeited.
+ *   outs      - broadcast array of FILE* for notifying remaining players.
+ *
+ * Returns:
+ *   >0 status indicating the game should end early for this table.
+ *
+ * Side effects:
+ *   - Broadcasts an appropriate server message to remaining clients.
+ *   - May update server/accounting counters (e.g., active sockets) elsewhere.
+ *   - Leaves further cleanup to the caller.
+ *
+ * Concurrency:
+ *   Called from the game’s trick thread/context. Uses only provided streams.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static int handle_disconnect_early(ServerContext* serverCtx, Game* game,
                                    int seat, FILE* outs[MAX_PLAYERS]) {
     const char* disp = NULL;
@@ -1248,7 +1285,45 @@ static int handle_disconnect_early(ServerContext* serverCtx, Game* game,
     return 1; // terminated
 }
 
-// --- helper: read, validate, apply a single play (≈ 45 LOC) ---
+/**
+ * read_and_apply_valid_card
+ * -------------------------
+ * Reads the next play from the given player's input stream, validates it
+ * against the current hand and trick rules, applies the play, and broadcasts
+ * it to all players. If the seat is leading, this sets the lead suit; if not,
+ * it enforces "follow-suit if able". Updates the plays[] array and removes the
+ * card from the player's hand on success.
+ *
+ * Parameters:
+ *   serverCtx     - pointer to ServerContext (for any counters/limits needed).
+ *   game          - current Game (names, seats, options).
+ *   seat          - the seat index [0..3] of the acting player.
+ *   trickOffset   - 0-based trick index for this deal (for logging/messages).
+ *   isLeader      - true iff this seat leads the trick.
+ *   leadSuitInOut - in/out: when isLeader==true, set to the led suit; otherwise
+ *                   must match the leader’s suit unless the hand cannot follow.
+ *   in            - FILE* to read the player's input line.
+ *   out           - FILE* to write any per-player prompts/acks (may be NULL).
+ *   hand          - pointer to this player's current PlayerHand (mutated).
+ *   outs          - broadcast array of FILE* (may contain NULLs).
+ *   plays         - out param: per-seat 2-char card codes for this trick.
+ *
+ * Returns:
+ *   0 on success (valid card consumed and applied).
+ *   >0 on early termination (e.g., disconnect/EOF/invalid protocol per spec).
+ *
+ * Side effects:
+ *   - Consumes one input line from 'in'; may write prompts/errs to 'out'.
+ *   - Broadcasts the accepted play to all non-NULL 'outs'.
+ *   - Removes the played card from 'hand'; sets/reads *leadSuitInOut.
+ *   - May trigger early-game abort path when input/protocol fails.
+ *
+ * Concurrency:
+ *   Intended to be called from the single-threaded trick loop for a game.
+ *   Performs blocking I/O on 'in' and 'outs'; no shared mutex required here.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static int read_and_apply_valid_card(ServerContext* serverCtx, Game* game,
                                      int seat, int trickOffset, bool isLeader,
                                      char* leadSuitInOut, FILE* in, FILE* out,
@@ -1289,7 +1364,38 @@ static int read_and_apply_valid_card(ServerContext* serverCtx, Game* game,
     }
 }
 
-// --- helper: play a single trick; returns 0 ok / 1 terminated (≈ 45 LOC) ---
+/**
+ * play_single_trick
+ * -----------------
+ * Orchestrates one full trick starting from leaderSeat: iterates through four
+ * seats in turn order, reading and validating plays, broadcasting them, and
+ * then determining the winning seat per the game’s trick-taking rules. On any
+ * player disconnect/ protocol failure, aborts early and signals the caller.
+ *
+ * Parameters:
+ *   serverCtx     - pointer to ServerContext (for counters/limits).
+ *   game          - current Game (names, seat order, options).
+ *   ins           - per-seat FILE* inputs (NULL if seat not connected).
+ *   outs          - per-seat FILE* outputs for broadcasts (may be NULL).
+ *   hands         - per-seat PlayerHand array (each mutated as cards are played).
+ *   leaderSeat    - seat index [0..3] that leads this trick.
+ *   winnerSeatOut - out param: on success, set to winning seat index [0..3].
+ *
+ * Returns:
+ *   0 on success (trick completed and winner computed).
+ *   >0 if the hand/game should terminate early (disconnect/invalid protocol).
+ *
+ * Side effects:
+ *   - Consumes up to four input lines (one per seat) and broadcasts plays.
+ *   - Mutates 'hands' by removing the four played cards.
+ *   - Writes server messages to 'outs' (e.g., play lines, end-of-trick info).
+ *
+ * Concurrency:
+ *   Runs inside the single game context; uses blocking I/O on the streams.
+ *   No shared-global locks taken here; stats/atomics updated by callers.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
 static int play_single_trick(ServerContext* serverCtx, Game* game,
                              FILE* ins[MAX_PLAYERS], FILE* outs[MAX_PLAYERS],
                              PlayerHand hands[MAX_PLAYERS],
@@ -1641,6 +1747,184 @@ static void start_pending_fd_monitor(ServerContext *ctx) {
     (void)pthread_detach(tid);
 }
 
+
+
+
+/**
+ * reseat_players_lex
+ * ------------------
+ * Re-seats players in-place so seats 0..3 are in lexicographic order by
+ * player name. NULL names sort after non-NULL names. FDs and names are
+ * remapped consistently so seat indices reflect the new order.
+ *
+ * Parameters:
+ *   game - pointer to Game whose playerFds/playerNames will be reordered.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   - Mutates game->playerFds[0..3] and game->playerNames[0..3] in-place.
+ *   - Seat-to-player mapping changes; callers must use new seat order.
+ *
+ * Concurrency:
+ *   Should be called before any per-seat streams are created. No locking
+ *   required; operates only on the provided Game object.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
+static void reseat_players_lex(Game* game) {
+    int order[MAX_PLAYERS] = {0, 1, 2, MAX_PLAYERS-1};
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        for (int j = i + 1; j < MAX_PLAYERS; ++j) {
+            const char* ai = game->playerNames[order[i]];
+            const char* aj = game->playerNames[order[j]];
+            int cmp = 0;
+            if (ai && aj) cmp = strcmp(ai, aj);
+            else if (ai && !aj) cmp = -1;
+            else if (!ai && aj) cmp = 1;
+            if (cmp > 0) {
+                int t = order[i];
+                order[i] = order[j];
+                order[j] = t;
+            }
+        }
+    }
+    int newFds[MAX_PLAYERS] = {-1, -1, -1, -1};
+    char* newNames[MAX_PLAYERS] = {NULL, NULL, NULL, NULL};
+    for (int s = 0; s < MAX_PLAYERS; ++s) {
+        int idx = order[s];
+        newFds[s] = game->playerFds[idx];
+        newNames[s] = game->playerNames[idx];
+    }
+    for (int s = 0; s < MAX_PLAYERS; ++s) {
+        game->playerFds[s] = newFds[s];
+        game->playerNames[s] = newNames[s];
+    }
+}
+
+/**
+ * setup_streams_deal_and_announce
+ * -------------------------------
+ * Opens per-player write/read FILE* streams, announces teams, deals and
+ * sends hands, materialises PlayerHand structs, and broadcasts the game
+ * start banner. Optionally returns the deck string used for dealing.
+ *
+ * Parameters:
+ *   game     - Game holding player FDs and names.
+ *   ins      - output array [0..3] filled with read FILE* (may be NULL).
+ *   outs     - output array [0..3] filled with write FILE* (line buffered).
+ *   hands    - output array [0..3] of PlayerHand built from the deck.
+ *   pDeckStr - optional out; if non-NULL, set to internal deck string.
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   - Duplicates player FDs via dup() and fdopen() for ins/outs.
+ *   - Writes "MTeam 1/2" lines and "MStarting the game" to all outs.
+ *   - Sets outs to line-buffered mode.
+ *
+ * Concurrency:
+ *   Purely local to this game instance; no shared-global mutations beyond
+ *   I/O on player connections.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
+static void setup_streams_deal_and_announce(
+        Game* game, FILE* ins[], FILE* outs[],
+        PlayerHand hands[], const char** pDeckStr) {
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        outs[i] = NULL;
+        if (game->playerFds[i] >= 0) {
+            outs[i] = fdopen(dup(game->playerFds[i]), "w");
+            if (outs[i]) setvbuf(outs[i], NULL, _IOLBF, 0);
+        }
+    }
+    char team1Msg[MAX_TEAM_MSG], team2Msg[MAX_TEAM_MSG];
+    snprintf(team1Msg, sizeof team1Msg, "MTeam 1: %s, %s\n",
+             game->playerNames[0] ? game->playerNames[0] : "P1",
+             game->playerNames[2] ? game->playerNames[2] : "P3");
+    snprintf(team2Msg, sizeof team2Msg, "MTeam 2: %s, %s\n",
+             game->playerNames[1] ? game->playerNames[1] : "P2",
+             game->playerNames[MAX_PLAYERS-1] ? game->playerNames[MAX_PLAYERS-1] : "P4");
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (outs[i]) {
+            fputs(team1Msg, outs[i]);
+            fputs(team2Msg, outs[i]);
+            fflush(outs[i]);
+        }
+    }
+    const char* deckStr = get_deck_or_die();
+    if (pDeckStr) *pDeckStr = deckStr;
+    deal_and_send_hands(outs, deckStr);
+    build_hands_from_deck(deckStr, hands);
+    broadcast_msg(outs, "MStarting the game\n");
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        ins[i] = NULL;
+        if (game->playerFds[i] >= 0) {
+            ins[i] = fdopen(dup(game->playerFds[i]), "r");
+        }
+    }
+}
+
+/**
+ * run_game_and_cleanup
+ * --------------------
+ * Runs the trick loop while updating atomic counters, then tears down all
+ * streams and sockets, frees player names and the Game, releases the four
+ * connection-limit slots, and updates completion statistics if applicable.
+ *
+ * Parameters:
+ *   serverCtx - pointer to ServerContext (atomics, limits).
+ *   game      - Game to clean up after play.
+ *   ins       - per-player FILE* inputs (may contain NULLs).
+ *   outs      - per-player FILE* outputs (may contain NULLs).
+ *   hands     - per-player PlayerHand array provided to play_tricks().
+ *
+ * Returns:
+ *   None.
+ *
+ * Side effects:
+ *   - Increments/decrements gamesRunning; increments gamesCompleted on
+ *     normal end. Closes and frees all player resources.
+ *   - Decrements activeClientSockets once per player FD.
+ *   - Calls release_conn_slot() four times.
+ *
+ * Concurrency:
+ *   Uses atomics only; no mutexes here. Assumes no other threads hold
+ *   references to the Game once play_tricks() returns.
+ *
+ * REF: Comments created by AI, reviewed and modified for assignment compliance.
+ */
+static void run_game_and_cleanup(ServerContext* serverCtx, Game* game,
+                                 FILE* ins[], FILE* outs[],
+                                 PlayerHand hands[]) {
+    atomic_fetch_add(&serverCtx->gamesRunning, 1u);
+    int ended = play_tricks(serverCtx, game, ins, outs, hands);
+    atomic_fetch_sub(&serverCtx->gamesRunning, 1u);
+    if (ended == 0) {
+        atomic_fetch_add(&serverCtx->gamesCompleted, 1u);
+    }
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (ins[i]) fclose(ins[i]);
+        if (outs[i]) fclose(outs[i]);
+    }
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (game->playerFds[i] >= 0) {
+            close(game->playerFds[i]);
+            atomic_fetch_sub(&serverCtx->activeClientSockets, 1u);
+            game->playerFds[i] = -1;
+        }
+        free(game->playerNames[i]);
+        game->playerNames[i] = NULL;
+    }
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        release_conn_slot(serverCtx);
+    }
+    free(game);
+}
+
 /**
  * start_game
  * ----------
@@ -1669,95 +1953,13 @@ static void start_pending_fd_monitor(ServerContext *ctx) {
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 static void start_game(ServerContext* serverCtx, Game* game) {
-    // Reseat by alphabetical player name so seats 0..3 are lexicographic
-    int order[MAX_PLAYERS] = {0, 1, 2, MAX_PLAYERS-1};
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        for (int j = i + 1; j < MAX_PLAYERS; ++j) {
-            const char *ai = game->playerNames[ order[i] ];
-            const char *aj = game->playerNames[ order[j] ];
-            int cmp;
-            if (ai && aj)       cmp = strcmp(ai, aj);
-            else if (ai && !aj) cmp = -1;
-            else if (!ai && aj) cmp = 1;
-            else                cmp = 0;
-            if (cmp > 0) { int t = order[i]; order[i] = order[j]; order[j] = t; }
-        }
-    }
-    int newFds[MAX_PLAYERS]     = {-1, -1, -1, -1};
-    char *newNames[MAX_PLAYERS] = {NULL, NULL, NULL, NULL};
-    for (int s = 0; s < MAX_PLAYERS; ++s) {
-        int idx = order[s];
-        newFds[s]   = game->playerFds[idx];
-        newNames[s] = game->playerNames[idx];
-    }
-    for (int s = 0; s < MAX_PLAYERS; ++s) {
-        game->playerFds[s]   = newFds[s];
-        game->playerNames[s] = newNames[s];
-    }
-
-    FILE *outs[MAX_PLAYERS] = {0};
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (game->playerFds[i] >= 0) {
-            outs[i] = fdopen(dup(game->playerFds[i]), "w");
-            if (outs[i]) setvbuf(outs[i], NULL, _IOLBF, 0);
-        }
-    }
-
-    // Announce teams
-    char team1Msg[MAX_TEAM_MSG], team2Msg[MAX_TEAM_MSG];
-    snprintf(team1Msg, sizeof team1Msg, "MTeam 1: %s, %s\n",
-             game->playerNames[0] ? game->playerNames[0] : "P1",
-             game->playerNames[2] ? game->playerNames[2] : "P3");
-    snprintf(team2Msg, sizeof team2Msg, "MTeam 2: %s, %s\n",
-             game->playerNames[1] ? game->playerNames[1] : "P2",
-             game->playerNames[MAX_PLAYERS - 1] ? game->playerNames[MAX_PLAYERS - 1] : "P4");
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (outs[i]) { fputs(team1Msg, outs[i]); fputs(team2Msg, outs[i]); fflush(outs[i]); }
-    }
-
-    const char *deckStr = get_deck_or_die();
-    deal_and_send_hands(outs, deckStr);
-
+    reseat_players_lex(game);
+    FILE* ins[MAX_PLAYERS] = {0};
+    FILE* outs[MAX_PLAYERS] = {0};
     PlayerHand hands[MAX_PLAYERS];
-    build_hands_from_deck(deckStr, hands);
-
-    broadcast_msg(outs, "MStarting the game\n");
-
-    FILE *ins[MAX_PLAYERS] = {0};
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (game->playerFds[i] >= 0) {
-            ins[i] = fdopen(dup(game->playerFds[i]), "r");
-        }
-    }
-
-    atomic_fetch_add(&serverCtx->gamesRunning, 1u);
-    int ended = play_tricks(serverCtx, game, ins, outs, hands);
-    atomic_fetch_sub(&serverCtx->gamesRunning, 1u);
-    if (ended == 0) {
-        atomic_fetch_add(&serverCtx->gamesCompleted, 1u);
-    }
-
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (ins[i])  fclose(ins[i]);
-        if (outs[i]) fclose(outs[i]);
-    }
-
-    // Close original sockets and free names (decrement live count per socket)
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        if (game->playerFds[i] >= 0) {
-            close(game->playerFds[i]);
-            atomic_fetch_sub(&serverCtx->activeClientSockets, 1u); // NEW
-            game->playerFds[i] = -1;
-        }
-        free(game->playerNames[i]);
-        game->playerNames[i] = NULL;
-    }
-
-    // Free connection-limit slots for those 4 players
-    for (int i = 0; i < MAX_PLAYERS; ++i) {
-        release_conn_slot(serverCtx);
-    }
-    free(game);
+    const char* deckStr = NULL;
+    setup_streams_deal_and_announce(game, ins, outs, hands, &deckStr);
+    run_game_and_cleanup(serverCtx, game, ins, outs, hands);
 }
 
 
