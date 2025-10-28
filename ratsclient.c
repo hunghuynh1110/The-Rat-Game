@@ -9,10 +9,42 @@
 #define MAX_CARDS 13
 #define CARD_LEN 4
 
+#define NUMBER_ARGUMENT_EXIT 3
+#define INVALID_ARGUMENT 20
+#define SERVER_CONNECT_ERROR 5
+#define PROTOCOL_ERROR 7
+#define QUIT_ERROR 17
+#define GAME_OVER 0
+#define ARR_SIZE 3
+
+#define A_VALUE 14
+#define K_VALUE 13
+#define Q_VALUE 12
+#define J_VALUE 11
+#define T_VALUE 10
+
+#define S_VALUE 0
+#define C_VALUE 1
+#define D_VALUE 2
+#define H_VALUE 3
+#define DEFAULT_SUIT 4
+
+#define MAX_RANK 9
+#define MIN_RANK 2
+#define MAX_ARGUMENT_SIZE 4
+#define NULL_TERMINATE 2
+#define STR_LEN 2
+#define BUFF_SIZE 16
+#define MAX_BUFFER 256
+
+#define ARG1 1
+#define ARG2 2
+#define ARG3 3
+
 typedef struct {
     char cards[MAX_CARDS][CARD_LEN];
     int count;
-    char lastSend[3];
+    char lastSend[ARR_SIZE];
 } Hand;
 
 
@@ -37,7 +69,7 @@ int get_rank_value(char rank);
 int get_suit_value(char suit);
 int compare_cards(const void *a, const void *b);
 
-static void remove_card_from_hand(Hand *hand, const char rs[3]);
+static void remove_card_from_hand(Hand *hand, const char rs[ARR_SIZE]);
 static int card_in_hand(const Hand *hand, char r, char s);
 
 
@@ -65,11 +97,11 @@ int get_rank_value(char rank) {
         return rank - '0';
     }
     switch (rank) {
-        case 'A': return 14;
-        case 'K': return 13;
-        case 'Q': return 12;
-        case 'J': return 11;
-        case 'T': return 10;
+        case 'A': return A_VALUE;
+        case 'K': return K_VALUE;
+        case 'Q': return Q_VALUE;
+        case 'J': return J_VALUE;
+        case 'T': return T_VALUE;
         default: return 0; // Should not happen
     }
 }
@@ -92,12 +124,12 @@ int get_rank_value(char rank) {
  */
 int get_suit_value(char suit) {
     switch (suit) {
-        case 'S': return 0;
-        case 'C': return 1;
-        case 'D': return 2;
-        case 'H': return 3;
+        case 'S': return S_VALUE;
+        case 'C': return C_VALUE;
+        case 'D': return D_VALUE;
+        case 'H': return H_VALUE;
         default:
-            return 4;
+            return DEFAULT_SUIT;
         }
 }
 
@@ -166,7 +198,7 @@ int compare_cards(const void *a, const void *b) {
  *
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
-static void remove_card_from_hand(Hand *hand, const char rs[3]) {
+static void remove_card_from_hand(Hand *hand, const char rs[ARR_SIZE]) {
     if (!hand || !rs || rs[0] == '\0' || rs[1] == '\0') return;
 
     for (int i = 0; i < hand->count; ++i) {
@@ -234,14 +266,14 @@ static int card_in_hand(const Hand *hand, char r, char s) {
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 void validate_arguments(int argc, char *argv[]) {
-    if (argc != 4) {
+    if (argc != MAX_ARGUMENT_SIZE) {
         fprintf(stderr, "Usage: ./ratsclient clientname game port\n");
-        exit(3);
+        exit(NUMBER_ARGUMENT_EXIT);
     }
-    for (int i = 1; i < 4; i++) {
+    for (int i = 1; i < MAX_ARGUMENT_SIZE; i++) {
         if (strlen(argv[i]) == 0) {
             fprintf(stderr, "ratsclient: invalid arguments\n");
-            exit(20);
+            exit(INVALID_ARGUMENT);
         }
     }
 }
@@ -277,7 +309,7 @@ int check_and_connect_port(const char *port) {
     int status = getaddrinfo("localhost", port, &addrHints, &resolvedAddrs);
     if (status != 0) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
-        exit(5);
+        exit(SERVER_CONNECT_ERROR);
     }
 
     for (addrPtr = resolvedAddrs; addrPtr != NULL; addrPtr = addrPtr->ai_next) {
@@ -298,7 +330,7 @@ int check_and_connect_port(const char *port) {
     //check all connection fail
     if (connectionFd == -1) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
-        exit(5);
+        exit(SERVER_CONNECT_ERROR);
     }
 
     return connectionFd;
@@ -330,22 +362,22 @@ FILE* setup_server_streams(int sockfd, FILE **serverOut) {
     if (!serverIn) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
         close(sockfd);
-        exit(5);
+        exit(SERVER_CONNECT_ERROR);
     }
     
-    int output_file_descriptor = dup(sockfd);
-    if (output_file_descriptor == -1) {
+    int outputFd = dup(sockfd);
+    if (outputFd == -1) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
         fclose(serverIn);
-        exit(5);
+        exit(SERVER_CONNECT_ERROR);
     }
     
-    *serverOut = fdopen(output_file_descriptor, "w");
+    *serverOut = fdopen(outputFd, "w");
     if (!*serverOut) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
         fclose(serverIn);
-        close(output_file_descriptor);
-        exit(5);
+        close(outputFd);
+        exit(SERVER_CONNECT_ERROR);
     }
     
     setvbuf(*serverOut, NULL, _IOLBF, 0);
@@ -376,7 +408,7 @@ void send_client_info(FILE *serverOut, const char *clientName, const char *gameN
         fprintf(serverOut, "%s\n", gameName) < 0 || fflush(serverOut) != 0) {
         fprintf(stderr, "ratsclient: unable to connect to the server\n");
         fclose(serverOut);
-        exit(5);
+        exit(SERVER_CONNECT_ERROR);
     }
 }
 
@@ -481,7 +513,7 @@ void parse_hand_message(const char* message, Hand* hand) {
         // First char from server is suit, second is rank
         hand->cards[hand->count][0] = *ptr++; // rank first
         hand->cards[hand->count][1] = *ptr++; // suit second
-        hand->cards[hand->count][2] = '\0';   // Null-terminate
+        hand->cards[hand->count][NULL_TERMINATE] = '\0';   // Null-terminate
         
         hand->count++;
         
@@ -521,14 +553,14 @@ void handle_lead(FILE *serverOut, Hand *hand) {
         printf("Lead> ");
         fflush(stdout);
 
-        char buf[16];
+        char buf[BUFF_SIZE];
         if (!fgets(buf, sizeof buf, stdin)) {
             fprintf(stderr, "ratsclient: user has quit\n");
-            exit(17);
+            exit(QUIT_ERROR);
         }
         buf[strcspn(buf, "\r\n")] = '\0';
 
-        if (strlen(buf) != 2) {
+        if (strlen(buf) != STR_LEN) {
             continue; // re-prompt; do not talk to server
         }
 
@@ -539,7 +571,7 @@ void handle_lead(FILE *serverOut, Hand *hand) {
         if (get_rank_value(r) == 0) {
             continue;
         }
-        if (get_suit_value(s) > 3) { // invalid suit
+        if (get_suit_value(s) >= DEFAULT_SUIT) { // invalid suit
             continue;
         }
         // Must exist in hand (leader has no follow-suit restriction)
@@ -552,7 +584,7 @@ void handle_lead(FILE *serverOut, Hand *hand) {
         fflush(serverOut);
         hand->lastSend[0] = r;
         hand->lastSend[1] = s;
-        hand->lastSend[2] = '\0';
+        hand->lastSend[NULL_TERMINATE] = '\0';
         return;
     }
 }
@@ -585,33 +617,26 @@ void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
         display_hand(hand);
         printf("[%c] play> ", leadSuit);
         fflush(stdout);
-
-        char buf[16];
+        char buf[BUFF_SIZE];
         if (!fgets(buf, sizeof buf, stdin)) {
             fprintf(stderr, "ratsclient: user has quit\n");
-            exit(17);
+            exit(QUIT_ERROR);
         }
         buf[strcspn(buf, "\r\n")] = '\0';
-
-        if (strlen(buf) != 2) {
+        if (strlen(buf) != STR_LEN) {
             continue; // re-prompt; do not talk to server
         }
-
         char r = buf[0];
         char s = buf[1];
-
-        // Validate characters
         if (get_rank_value(r) == 0) {
             continue;
         }
-        if (get_suit_value(s) > 3) { // invalid suit
+        if (get_suit_value(s) >= DEFAULT_SUIT) { // invalid suit
             continue;
         }
-        // Must exist in the hand
         if (!card_in_hand(hand, r, s)) {
             continue;
         }
-        // If we have any of the lead suit, the chosen card must match leadSuit
         int haveLead = 0;
         for (int i = 0; i < hand->count; ++i) {
             if (hand->cards[i][1] == leadSuit) { haveLead = 1; break; }
@@ -619,13 +644,11 @@ void handle_play(FILE *serverOut, Hand *hand, char leadSuit) {
         if (haveLead && s != leadSuit) {
             continue;
         }
-
-        // Send once valid
         fprintf(serverOut, "%c%c\n", r, s);
         fflush(serverOut);
         hand->lastSend[0] = r;
         hand->lastSend[1] = s;
-        hand->lastSend[2] = '\0';
+        hand->lastSend[NULL_TERMINATE] = '\0';
         return;
     }
 }
@@ -656,7 +679,7 @@ void handle_accept(Hand *hand) {
         remove_card_from_hand(hand, hand->lastSend);   // <- fixed name
         hand->lastSend[0] = '\0';
         hand->lastSend[1] = '\0';
-        hand->lastSend[2] = '\0';
+        hand->lastSend[NULL_TERMINATE] = '\0';
     }
 }
 
@@ -703,7 +726,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
         case 'H':
             if (hand->count > 0) {
                 fprintf(stderr, "ratsclient: a protocol error occurred\n");
-                exit(7);
+                exit(PROTOCOL_ERROR);
             }
             parse_hand_message(message, hand);
             display_hand(hand);
@@ -712,12 +735,12 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
             char suit;
             if (sscanf(message, "P %c", &suit) != 1 && sscanf(message, "P%c", &suit) != 1) {
                 fprintf(stderr, "ratsclient: a protocol error occurred\n");
-                exit(7);
+                exit(PROTOCOL_ERROR);
             }
             // sanity-check the suit
             if (suit != 'S' && suit != 'C' && suit != 'D' && suit != 'H') {
                 fprintf(stderr, "ratsclient: a protocol error occurred\n");
-                exit(7);
+                exit(PROTOCOL_ERROR);
             }
 
             handle_play(serverOut, hand, suit);
@@ -729,7 +752,7 @@ void handle_message(const char *message, FILE* serverOut, Hand* hand) {
 
         default:
             fprintf(stderr, "ratsclient: a protocol error occurred\n");
-            exit(7);
+            exit(PROTOCOL_ERROR);
     }
 }
 
@@ -740,9 +763,9 @@ int main(int argc, char *argv[]) {
     // Ensure prompts/lines appear immediately when stdout is piped by tests
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
-    char *clientName = argv[1];
-    char *gameName   = argv[2];
-    char *port       = argv[3];
+    char *clientName = argv[ARG1];
+    char *gameName   = argv[ARG2];
+    char *port       = argv[ARG3];
 
     // 2. Connect to server
     int sockfd = check_and_connect_port(port);
@@ -754,14 +777,14 @@ int main(int argc, char *argv[]) {
     send_client_info(serverOut, clientName, gameName);
     
     Hand hand;
-    char messageBuffer[256];
+    char messageBuffer[MAX_BUFFER];
     memset(&hand, 0, sizeof(hand));
 
     while (fgets(messageBuffer, sizeof(messageBuffer), serverIn)) {
         handle_message(messageBuffer, serverOut, &hand);
     }
     fprintf(stderr, "ratsclient: a protocol error occurred\n");
-    exit(7);
+    exit(PROTOCOL_ERROR);
 
     
     return 0;
