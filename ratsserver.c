@@ -16,7 +16,6 @@
 #include <signal.h>
 #include <pthread.h>
 
-#define EXIT_INVALID_PORT 1  // ← set this to the spec’s † value if different
 
 typedef struct ServerContext ServerContext; // forward-declare for pointer usage
 typedef struct {
@@ -26,12 +25,15 @@ typedef struct {
 } ClientArg;
 
 #define MAX_GAME_NAME 256
-#define MAX_PLAYER 4
+#define MAX_PLAYERS 4
+#define EXIT_INVALID_PORT 1  // ← set this to the spec’s † value if different
 
 typedef struct Game {
     char gameName[MAX_GAME_NAME];
-    int playerCount;
-    struct Game *next;
+    int playerCount;                    // number of players currently joined (0..4)
+    int playerFds[MAX_PLAYERS];         // connected client fds by join order (we may reseat later)
+    char* playerNames[MAX_PLAYERS];     // heap-allocated player names
+    struct Game *next;                  // singly-linked list
 } Game;
 
 // All shared server state lives in this context and is passed around — no globals.
@@ -49,12 +51,16 @@ static void die_usage(void);
 static bool parse_maxconns(const char* s, unsigned* out);
 static int listen_and_report_port(const char* portMsg, const char* service);
 static void block_sigpipe_all_threads(void);
+static void *client_greeting_thread(void *threadArg);
 static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx);
 static char *read_line_alloc(FILE *inStream);
 static void send_line(FILE *outStream, const char *text);
 static bool read_join_info(FILE *inStream, char **playerNameOut, char **gameNameOut);
 static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* gameName);
-
+static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, const char* playerName, int clientFd);
+static int handle_client_join(ServerContext *serverCtx, int clientFd, 
+    FILE *inStream, char **playerNameOut, Game **gameOut);
+static void unlink_pending_game(ServerContext* serverCtx, Game* target);
 
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
@@ -153,6 +159,7 @@ static void* client_greeting_thread(void* threadArg) {
     ClientArg* clientArg = (ClientArg*)threadArg;
     int clientFd = clientArg->fd;
     const char* greetingMessage = clientArg->greeting;
+    ServerContext *serverCtx = clientArg->serverCtx;
 
     FILE* clientOut = fdopen(dup(clientFd), "w");
     if (clientOut) {
@@ -161,7 +168,36 @@ static void* client_greeting_thread(void* threadArg) {
         fclose(clientOut);
     }
 
-    close(clientFd);
+    FILE* clientIn = fdopen(dup(clientFd), "r");
+    if (!clientIn) {
+        close(clientFd);
+        free(clientArg);
+        return NULL;
+    }
+
+    char *playerName = NULL;
+    Game *game = NULL;
+
+    int seatIndex = handle_client_join(serverCtx, clientFd, clientIn, &playerName, &game);
+    fclose(clientIn);
+
+    if(seatIndex<0) {
+        close(clientFd);
+        free(playerName);
+        free(clientArg);
+        return NULL;
+    }
+
+    free(playerName);
+
+    //check if full
+    if(seatIndex < (MAX_PLAYERS-1)) {
+        free(clientArg);
+        return NULL;
+    }
+
+    // TODO: start_game(serverCtx, game);
+
     free(clientArg);
     return NULL;
 }
@@ -282,11 +318,97 @@ static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* ga
 
     snprintf(newGame->gameName, sizeof newGame->gameName, "%s", gameName);
     newGame->playerCount = 0;
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        newGame->playerFds[i] = -1;
+        newGame->playerNames[i] = NULL;
+    }
     newGame->next = serverCtx->pendingGamesHead;
     serverCtx->pendingGamesHead = newGame;
 
     pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
     return newGame;
+}
+
+// Adds a player to a pending game under the registry lock.
+// Returns the seat index (0..3) on success, or -1 on failure (full/OOM/bad args).
+static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, const char* playerName, int clientFd) {
+    if (!serverCtx || !game || !playerName || !*playerName || clientFd < 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+
+    if (game->playerCount >= MAX_PLAYERS) {
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+        return -1;
+    }
+
+    int seatIndex = game->playerCount;      // join order; seating may be rearranged later
+    game->playerFds[seatIndex] = clientFd;
+    game->playerNames[seatIndex] = strdup(playerName);
+    if (!game->playerNames[seatIndex]) {
+        game->playerFds[seatIndex] = -1;
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+        return -1;
+    }
+
+    game->playerCount++;
+
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+    return seatIndex;
+}
+
+static int handle_client_join(ServerContext *serverCtx, int clientFd, 
+    FILE *inStream, char **playerNameOut, Game **gameOut) {
+        if(!serverCtx || clientFd<0 || !inStream || !playerNameOut || !gameOut) {
+            return -1;
+        }
+
+        char* playerName = NULL;
+        char *gameName = NULL;
+        if(!read_join_info(inStream, &playerName, &gameName)) {
+            // EOF / protocol error
+            free(playerName);
+            free(gameName);
+            return -1;
+        }
+
+        Game *game = get_or_create_pending_game(serverCtx, gameName);
+        if(!game) {
+            free(playerName);
+            free(gameName);
+            return -1;
+        }
+
+        int seatIndex = add_player_to_pending_game(serverCtx, game, playerName, clientFd);
+        if(seatIndex < 0) {
+            free(playerName);
+            free(gameName);
+            return -1;
+        }
+
+        *playerNameOut = playerName;
+        *gameOut = game;
+        free(gameName);
+        return seatIndex;
+}
+
+static void unlink_pending_game(ServerContext* serverCtx, Game* target) {
+    if(!serverCtx || !target) {
+        return;
+    }
+
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+    Game **cursor = &serverCtx->pendingGamesHead;
+    while(*cursor) {
+        if(*cursor == target) {
+            *cursor = target->next;
+            target->next = NULL;
+            break;
+        }
+        cursor = &(*cursor)->next;
+    }
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
 }
 
 int main(int argc, char** argv) {
