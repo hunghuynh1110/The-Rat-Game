@@ -50,6 +50,8 @@ struct ServerContext {
 };
 
 
+
+
 static void die_usage(void);
 static bool parse_maxconns(const char* s, unsigned* out);
 static int listen_and_report_port(const char* portMsg, const char* service);
@@ -65,12 +67,27 @@ static int handle_client_join(ServerContext *serverCtx, int clientFd,
     FILE *inStream, char **playerNameOut, Game **gameOut);
 static void unlink_pending_game(ServerContext* serverCtx, Game* target);
 
+static void acquire_conn_slot(ServerContext *serverCtx);
+static void release_conn_slot(ServerContext *serverCtx);
+
 static void start_game(ServerContext *serverCtx, Game *target);
 static void broadcast_msg(FILE *outs[4], const char *fmt, ...);
 static void deal_and_send_hands(FILE *outs[4], const char *deckStr);
+static const char *get_deck_or_die(void);
 
+static int rank_value(char rankChar);
+static bool is_valid_rank(char rankChar);
+static bool is_valid_suit(char suitChar);
+static int winning_seat_in_trick(char leadSuit, const char plays[4][2]);
 
-
+static bool parse_card_token(const char *line, char *rankOut, char *suitOut);
+static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4]);
+/**
+ * 
+ * 
+ * 
+ * 
+ */
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
     exit(16);
@@ -163,7 +180,9 @@ static void block_sigpipe_all_threads(void) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 }
 
-// per new connection, immediately send M<greeting> then close.
+/**
+ * per new connection, immediately send M<greeting> then close.
+ */
 static void* client_greeting_thread(void* threadArg) {
     ClientArg* clientArg = (ClientArg*)threadArg;
     int clientFd = clientArg->fd;
@@ -180,6 +199,7 @@ static void* client_greeting_thread(void* threadArg) {
     FILE* clientIn = fdopen(dup(clientFd), "r");
     if (!clientIn) {
         close(clientFd);
+        release_conn_slot(serverCtx);
         free(clientArg);
         return NULL;
     }
@@ -190,8 +210,9 @@ static void* client_greeting_thread(void* threadArg) {
     int seatIndex = handle_client_join(serverCtx, clientFd, clientIn, &playerName, &game);
     fclose(clientIn);
 
-    if(seatIndex<0) {
+    if (seatIndex < 0) {
         close(clientFd);
+        release_conn_slot(serverCtx);
         free(playerName);
         free(clientArg);
         return NULL;
@@ -200,7 +221,8 @@ static void* client_greeting_thread(void* threadArg) {
     free(playerName);
 
     //check if full
-    if(seatIndex < (MAX_PLAYERS-1)) {
+    if (seatIndex < (MAX_PLAYERS - 1)) {
+        release_conn_slot(serverCtx);
         free(clientArg);
         return NULL;
     }
@@ -210,6 +232,7 @@ static void* client_greeting_thread(void* threadArg) {
     // TODO: 
     start_game(serverCtx, game);
 
+    release_conn_slot(serverCtx);
     free(clientArg);
     return NULL;
 }
@@ -229,9 +252,12 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
             continue;
         }
 
+        acquire_conn_slot(serverCtx);
+
         ClientArg *clientArg = malloc(sizeof *clientArg);
         if (!clientArg) {
             close(clientFd);
+            release_conn_slot(serverCtx);
             continue;
         }
         clientArg->fd = clientFd;
@@ -241,6 +267,7 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
         pthread_t threadId;
         if(pthread_create(&threadId, NULL, client_greeting_thread, clientArg) != 0) {
             close(clientFd);
+            release_conn_slot(serverCtx);
             free(clientArg);
             continue;
         }
@@ -302,7 +329,9 @@ static bool read_join_info(FILE *inStream, char **playerNameOut, char **gameName
     return true;
 }
 
-//looks up a pending game by name in serverCtx -> create it at head if not found
+/**
+ * looks up a pending game by name in serverCtx -> create it at head if not found
+ */
 static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* gameName) {
     if(!serverCtx || !gameName || !*gameName) {
         return NULL;
@@ -340,8 +369,10 @@ static Game* get_or_create_pending_game(ServerContext* serverCtx, const char* ga
     return newGame;
 }
 
-// Adds a player to a pending game under the registry lock.
-// Returns the seat index (0..3) on success, or -1 on failure (full/OOM/bad args).
+/**
+* Adds a player to a pending game under the registry lock.
+* Returns the seat index (0..3) on success, or -1 on failure (full/OOM/bad args)
+*/
 static int add_player_to_pending_game(ServerContext* serverCtx, Game* game, const char* playerName, int clientFd) {
     if (!serverCtx || !game || !playerName || !*playerName || clientFd < 0) {
         return -1;
@@ -422,6 +453,34 @@ static void unlink_pending_game(ServerContext* serverCtx, Game* target) {
     pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
 }
 
+// Connection limit: reserve a slot or wait until one is available.
+static void acquire_conn_slot(ServerContext *serverCtx) {
+    if (!serverCtx) {
+        return;
+    }
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+    if (serverCtx->maxConns > 0) {
+        while (serverCtx->activeClients >= serverCtx->maxConns) {
+            pthread_cond_wait(&serverCtx->canAccept, &serverCtx->pendingGamesMutex);
+        }
+    }
+    serverCtx->activeClients++;
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+}
+
+// Release a slot and wake one waiter (if any).
+static void release_conn_slot(ServerContext *serverCtx) {
+    if (!serverCtx) {
+        return;
+    }
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+    if (serverCtx->activeClients > 0) {
+        serverCtx->activeClients--;
+    }
+    pthread_cond_signal(&serverCtx->canAccept);
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+}
+
 static void broadcast_msg(FILE *outs[4], const char *fmt, ...) {
     if (!outs || !fmt) {
         return;
@@ -461,6 +520,155 @@ static void deal_and_send_hands(FILE *outs[4], const char *deckStr) {
     }
 }
 
+// Obtain a 104-char random deck string from the course library or exit with a system error.
+static const char *get_deck_or_die(void) {
+    const char *deck = get_random_deck();
+    if (!deck) {
+        // Spec: system error path
+        fprintf(stderr, "ratsserver: system error\n");
+        exit(3);
+    }
+    return deck;
+}
+
+// Return a strength value for rank comparison (2..A). Higher is stronger.
+static int rank_value(char rankChar) {
+    switch (rankChar) {
+        case '2': return 2;
+        case '3': return 3;
+        case '4': return 4;
+        case '5': return 5;
+        case '6': return 6;
+        case '7': return 7;
+        case '8': return 8;
+        case '9': return 9;
+        case 'T': return 10;
+        case 'J': return 11;
+        case 'Q': return 12;
+        case 'K': return 13;
+        case 'A': return 14;
+        default:  return -1;
+    }
+}
+
+// Validate a single rank character against the allowed set.
+static bool is_valid_rank(char rankChar) {
+    return rank_value(rankChar) != -1;
+}
+
+// Validate suit character against allowed suits S, C, D, H.
+static bool is_valid_suit(char suitChar) {
+    return suitChar == 'S' || suitChar == 'C' || suitChar == 'D' || suitChar == 'H';
+}
+
+// Given a 4-play trick (each play is [rank, suit]) and the lead suit,
+// return the seat index (0..3) that won the trick. Assumes plays are valid and present.
+static int winning_seat_in_trick(char leadSuit, const char plays[4][2]) {
+    int winner = 0;
+    int bestVal = -1;
+    for (int i = 0; i < 4; ++i) {
+        char r = plays[i][0];
+        char s = plays[i][1];
+        if (s != leadSuit) {
+            continue; // only lead-suit cards can win (no trumps defined in this game)
+        }
+        int v = rank_value(r);
+        if (v > bestVal) {
+            bestVal = v;
+            winner = i;
+        }
+    }
+    // If no card matched lead suit (shouldn't happen if validation enforces follow-suit),
+    // fall back to treating seat 0 (the leader) as winner.
+    if (bestVal < 0) {
+        return 0;
+    }
+    return winner;
+}
+
+static bool parse_card_token(const char *line, char *rankOut, char *suitOut) {
+    if(!line || !rankOut || !suitOut) {
+        return false;
+    }
+
+    size_t len = strlen(line);
+    if(len != 2) {
+        return false;
+    }
+
+    char r = line[0];
+    char s = line[1];
+
+    if(!is_valid_rank(r) || !is_valid_suit(s)) {
+        return false;
+    }
+
+    *rankOut = r;
+    *suitOut = s;
+    return true;
+}
+
+static void play_tricks(ServerContext *serverCtx, Game *game, FILE *ins[4], FILE *outs[4]) {
+    (void)serverCtx;
+    (void)game;
+
+    int leaderSeat = 0;
+    for (int trick = 0; trick < 13; ++trick) {
+        char plays[4][2] = {{0}};
+        char leadSuit = 0;
+
+        for (int offset = 0; offset < MAX_PLAYERS; ++offset) {
+            int seat = (leaderSeat + offset) % MAX_PLAYERS;
+            if(offset == 0) {
+                send_line(outs[seat], "L");
+            } else {
+                char prompt[3] = { 'P', leadSuit, '\0' };
+                send_line(outs[seat], prompt);
+            }
+
+            while(true) {
+                char *line = read_line_alloc(ins[seat]);
+                if(!line) {
+                    for (int j = 0; j < MAX_PLAYERS; ++j) {
+                        if(outs[j]) {
+                            fputs("O\n", outs[j]);
+                            fflush(outs[j]);
+                        }
+                    }
+                    return;
+                }
+
+                char r, s;
+                bool ok = parse_card_token(line, &r, &s);
+                free(line);
+                if(!ok) {
+                    send_line(outs[seat], "I");
+                    continue;
+                }
+
+                plays[offset][0] = r;
+                plays[offset][1] = s;
+                if(offset == 0) {
+                    leadSuit = s;
+                }
+                send_line(outs[seat], "A");
+                break;
+            }
+        }
+
+        int winOffset = winning_seat_in_trick(leadSuit, plays);
+        leaderSeat = (leaderSeat + winOffset) % MAX_PLAYERS;
+    }
+
+    //game over + notify
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if(outs[i]) {
+            fputs("O\n", outs[i]);
+            fflush(outs[i]);
+        }
+    }
+}
+
 static void start_game(ServerContext* serverCtx, Game* game) {
     (void)serverCtx;
 
@@ -488,19 +696,49 @@ static void start_game(ServerContext* serverCtx, Game* game) {
         }
     }
 
-    const char *deckStr = get_random_deck();
+    const char *deckStr = get_deck_or_die();
     deal_and_send_hands(outs, deckStr);
 
 
-    //announce start
+    // announce start
     broadcast_msg(outs, "MStarting the game\n");
 
-    //close write streams
-    for (int i = 0; i < MAX_PLAYERS;++i) {
-        if(outs[i]) {
+    // open read streams
+    FILE *ins[4] = {0};
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if(game->playerFds[i]>=0) {
+            ins[i] = fdopen(dup(game->playerFds[i]), "r");
+        }
+    }
+
+    // request valid card from leader
+    play_tricks(serverCtx, game, ins, outs);
+
+
+
+    // close write streams
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        if (ins[i])
+        {
+            fclose(ins[i]);
+        }
+        if (outs[i])
+        {
             fclose(outs[i]);
         }
     }
+
+    // Close original sockets and free game resources
+    for (int i = 0; i < MAX_PLAYERS; ++i) {
+        if (game->playerFds[i] >= 0) {
+            close(game->playerFds[i]);
+            game->playerFds[i] = -1;
+        }
+        free(game->playerNames[i]);
+        game->playerNames[i] = NULL;
+    }
+    free(game);
 }
 
 int main(int argc, char** argv) {
