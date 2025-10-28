@@ -47,6 +47,10 @@ struct ServerContext {
     unsigned maxConns;
     unsigned activeClients;
     pthread_cond_t canAccept;
+
+    unsigned long totalThreadsCreated;
+    unsigned long activeClientThreads;
+    unsigned long activeSockets;
 };
 
 // Server-side hand representation for each player (no globals; passed down)
@@ -97,6 +101,9 @@ static void announce_play(FILE *outs[4], const Game* game, int seat, char rankCh
 static void announce_trick_winner(FILE *outs[4], const Game* game, int winnerSeat);
 static int seat_to_team(int seat);
 static void announce_final_score(FILE *outs[4], int team1Tricks, int team2Tricks);
+
+//SIGHUP
+static void *hup_stats_thread(void *arg);
 
 static void die_usage(void) {
     fprintf(stderr, "Usage: ./ratsserver maxconns greeting [portnum]\n");
@@ -189,13 +196,8 @@ static void block_sigpipe_all_threads(void) {
     sigset_t set;
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
-
+    sigaddset(&set, SIGHUP);  // block SIGHUP so a helper thread sigwaits
     pthread_sigmask(SIG_BLOCK, &set, NULL);
-    // Ignore SIGHUP so the server is not terminated by it (statistics may be added later)
-    struct sigaction hup;
-    memset(&hup, 0, sizeof hup);
-    hup.sa_handler = SIG_IGN;
-    sigaction(SIGHUP, &hup, NULL);
 }
 
 /**
@@ -209,7 +211,8 @@ static void* client_greeting_thread(void* threadArg) {
     ClientArg* clientArg = (ClientArg*)threadArg;
     int clientFd = clientArg->fd;
     const char* greetingMessage = clientArg->greeting;
-    ServerContext *serverCtx = clientArg->serverCtx;
+    ServerContext* serverCtx = clientArg->serverCtx;
+    pthread_detach(pthread_self());  // prevent zombie threads
 
     FILE* clientOut = fdopen(dup(clientFd), "w");
     if (clientOut) {
@@ -223,12 +226,14 @@ static void* client_greeting_thread(void* threadArg) {
         close(clientFd);
         release_conn_slot(serverCtx);
         free(clientArg);
+        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+        serverCtx->activeClientThreads--;
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
-    char *playerName = NULL;
-    Game *game = NULL;
-
+    char* playerName = NULL;
+    Game* game = NULL;
     int seatIndex = handle_client_join(serverCtx, clientFd, clientIn, &playerName, &game);
     fclose(clientIn);
 
@@ -237,25 +242,34 @@ static void* client_greeting_thread(void* threadArg) {
         release_conn_slot(serverCtx);
         free(playerName);
         free(clientArg);
+        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+        serverCtx->activeClientThreads--;
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
     free(playerName);
 
-    //check if full
-    if (seatIndex < (MAX_PLAYERS - 1)) {
+    if (seatIndex < MAX_PLAYERS - 1) {
+        close(clientFd);
         free(clientArg);
+        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+        serverCtx->activeClientThreads--;
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
         return NULL;
     }
 
-    // seatIndex == 3 -> game just became full; prevent further joins on this game.
     unlink_pending_game(serverCtx, game);
-    // TODO: 
     start_game(serverCtx, game);
+    close(clientFd);
     free(clientArg);
+
+    pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+    serverCtx->activeClientThreads--;
+    pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
+
     return NULL;
 }
-
 
 static void accept_loop(int listenFd, const char *greeting, ServerContext *serverCtx) {
     for (;;) {
@@ -264,7 +278,10 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
         acquire_conn_slot(serverCtx);
 
         int clientFd = -1;
-        for (;;) {
+        bool retryOuter = false;
+
+        // Accept loop: retry on EINTR; on other errors, release slot and restart outer loop.
+        while (1) {
             struct sockaddr_in clientAddr;
             socklen_t clientLen = sizeof clientAddr;
             clientFd = accept(listenFd, (struct sockaddr *)&clientAddr, &clientLen);
@@ -272,14 +289,15 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
                 break; // got one
             }
             if (errno == EINTR) {
-                // Retry accept with the slot still reserved.
-                continue;
+                continue; // keep the reserved slot and retry accept
             }
-            // Other transient errors: release the reserved slot and try again.
+            // Any other error: free the reserved slot and restart the outer loop.
             release_conn_slot(serverCtx);
-            clientFd = -1;
-            // small backoff not required; just continue outer loop to reacquire and retry
-            goto continue_outer;
+            retryOuter = true;
+            break;
+        }
+        if (retryOuter) {
+            continue; // no goto needed
         }
 
         // Build per-client argument
@@ -288,7 +306,7 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
             // Cannot service this client; close and free the reserved slot.
             close(clientFd);
             release_conn_slot(serverCtx);
-            goto continue_outer;
+            continue;
         }
         clientArg->fd = clientFd;
         clientArg->greeting = greeting;
@@ -300,13 +318,14 @@ static void accept_loop(int listenFd, const char *greeting, ServerContext *serve
             close(clientFd);
             release_conn_slot(serverCtx);
             free(clientArg);
-            goto continue_outer;
+            continue;
         }
         pthread_detach(threadId);
 
-    continue_outer:
-        // loop forever serving clients
-        (void)0;
+        pthread_mutex_lock(&serverCtx->pendingGamesMutex);
+        serverCtx->totalThreadsCreated++;
+        serverCtx->activeClientThreads++;
+        pthread_mutex_unlock(&serverCtx->pendingGamesMutex);
     }
 }
 
@@ -990,6 +1009,32 @@ static void start_game(ServerContext* serverCtx, Game* game) {
     free(game);
 }
 
+//SIGHUP
+static void *hup_stats_thread(void *arg) {
+    ServerContext *ctx = (ServerContext *)arg;
+
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGHUP);
+
+    for (;;) {
+        int sig = 0;
+        if (sigwait(&set, &sig) != 0) continue;
+        if (sig == SIGHUP) {
+            pthread_mutex_lock(&ctx->pendingGamesMutex);
+            unsigned long total   = ctx->totalThreadsCreated;
+            unsigned long activeT = ctx->activeClientThreads;
+            unsigned long activeS = ctx->activeSockets;
+            pthread_mutex_unlock(&ctx->pendingGamesMutex);
+
+            fprintf(stderr, "Total threads created since listen\n%lu\n", total);
+            fprintf(stderr, "Active client threads\n%lu\n", activeT);
+            fprintf(stderr, "Active client sockets\n%lu\n", activeS);
+            fflush(stderr);
+        }
+    }
+    return NULL;
+}
 int main(int argc, char** argv) {
     // Usage checking: only shape/emptiness here
     if (argc != 3 && argc != 4) {
@@ -1024,6 +1069,15 @@ int main(int argc, char** argv) {
     serverCtx.maxConns = maxconnsValue;
     serverCtx.activeClients = 0;
     pthread_cond_init(&serverCtx.canAccept, NULL);
+
+    serverCtx.totalThreadsCreated = 0;
+    serverCtx.activeClientThreads = 0;
+    serverCtx.activeSockets = 0;
+
+    pthread_t hupThread;
+    if (pthread_create(&hupThread, NULL, hup_stats_thread, &serverCtx) == 0) {
+        pthread_detach(hupThread);
+    }
 
     // Serve forever
     accept_loop(listenFd, greeting, &serverCtx);
