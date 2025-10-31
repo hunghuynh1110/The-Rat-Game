@@ -1,41 +1,31 @@
-CC = gcc
-CFLAGS = -Wall -Wextra -pedantic -std=gnu99 -pthread
+# CSSE2310 A4 Makefile — clean & mark-safe
 
-all: ratsclient ratsserver
-
-ratsclient: ratsclient.o protocol.o
-	$(CC) $(CFLAGS) -o ratsclient ratsclient.o protocol.o
-
-ratsserver: ratsserver.o protocol.o
-	$(CC) $(CFLAGS) -o ratsserver ratsserver.o protocol.o
-
-clean:
-	rm -f *.o ratsclient ratsserver
-
-CC      = gcc
-CFLAGS  = -Wall -Wextra -pedantic -std=gnu99 -pthread
+CC       = gcc
+CFLAGS   = -Wall -Wextra -pedantic -std=gnu99 -pthread -MMD -MP
 MOSS_LIB = /local/courses/csse2310/lib
 
-# Link flags & libs for ratsserver only
-LDFLAGS_SERVER = -L$(MOSS_LIB) -Wl,-rpath,$(MOSS_LIB)
-LDLIBS_SERVER  = -lcsse2310a4
+# Server-only link flags & libs
+LDFLAGS_ratsserver = -L$(MOSS_LIB) -Wl,-rpath,$(MOSS_LIB)
+LDLIBS_ratsserver  = -lcsse2310a4
 
 OBJS_CLIENT = ratsclient.o protocol.o
 OBJS_SERVER = ratsserver.o protocol.o
 
 .PHONY: all clean
-
 all: ratsclient ratsserver
 
 ratsclient: $(OBJS_CLIENT)
 	$(CC) $(CFLAGS) -o $@ $(OBJS_CLIENT)
 
 ratsserver: $(OBJS_SERVER)
-	$(CC) $(CFLAGS) $(LDFLAGS_SERVER) -o $@ $(OBJS_SERVER) $(LDLIBS_SERVER)
+	$(CC) $(CFLAGS) $(LDFLAGS_ratsserver) -o $@ $(OBJS_SERVER) $(LDLIBS_ratsserver)
 
-# Generic compile rule
+# Generic compile rule (emits .o and a matching .d for deps)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Auto-include dependency files (safe if they don't exist yet)
+-include $(OBJS_CLIENT:.o=.d) $(OBJS_SERVER:.o=.d)
+
 clean:
-	rm -f *.o ratsclient ratsserver
+	rm -f *.o *.d ratsclient ratsserver

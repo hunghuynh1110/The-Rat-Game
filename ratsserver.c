@@ -31,7 +31,7 @@ typedef struct {
 
 #define MAX_GAME_NAME 256
 #define MAX_PLAYERS 4
-#define EXIT_INVALID_PORT 1  // ← set this to the spec’s † value if different
+#define EXIT_INVALID_PORT 1 
 
 #define MAX_MSG_SIZE 64
 #define HALF_MSG_SIZE 32
@@ -166,8 +166,6 @@ static void run_game_and_cleanup(ServerContext *serverCtx, Game *game,
 // SIGHUP
 static void *stats_sigwait_thread(void *arg);
 static void start_sighup_stats_thread(ServerContext *ctx);
-static void *pending_fd_monitor_thread(void *arg);
-static void start_pending_fd_monitor(ServerContext *ctx);
 
 /**
  * die_usage
@@ -1278,7 +1276,6 @@ static void send_invalid_and_reprompt(FILE* out, bool isLeader, char leadSuit) {
     if (isLeader) {
         send_line(out, "L");
     } else {
-        send_line(out, "I");
         char buf[MAX_PLAYERS-1] = { 'P', leadSuit, '\0' };
         send_line(out, buf);
     }
@@ -1545,13 +1542,19 @@ static void announce_play(FILE *outs[MAX_PLAYERS], const Game* game, int seat, c
  * REF: Comments created by AI, reviewed and modified for assignment compliance.
  */
 static void announce_trick_winner(FILE *outs[MAX_PLAYERS], const Game* game, int winnerSeat) {
-    (void)game; // winners are always announced as Px (seat labels), not by name
-    if (!outs) {
+    if (!outs || winnerSeat < 0 || winnerSeat >= MAX_PLAYERS) {
         return;
     }
-    char label[MAX_PLAYERS - 1] = {'P', (char)('1' + (winnerSeat >= 0 && winnerSeat < MAX_PLAYERS ? winnerSeat : 0)), '\0'};
+    const char *disp = NULL;
+    char fallback[MAX_ARGC] = { 'P', (char)('1' + winnerSeat), '\0' };
+    if (game && game->playerNames[winnerSeat] && game->playerNames[winnerSeat][0]) {
+        disp = game->playerNames[winnerSeat];
+    } else {
+        disp = fallback;  // just in case there’s no name
+    }
+
     char msg[HALF_MSG_SIZE];
-    snprintf(msg, sizeof msg, "M%s won\n", label);
+    snprintf(msg, sizeof msg, "M%s won\n", disp);
     for (int i = 0; i < MAX_PLAYERS; ++i) {
         if (outs[i]) {
             fputs(msg, outs[i]);
@@ -1706,95 +1709,7 @@ static void start_sighup_stats_thread(ServerContext *ctx) {
     (void)pthread_detach(tid);
 }
 
-/**
- * pending_fd_monitor_thread
- * -------------------------
- * Periodically scans all sockets in pending (not-yet-full) games to detect
- * disconnects (POLLHUP/POLLERR/POLLNVAL). When a pending player has dropped,
- * the function closes the fd, updates live/socket and connection-limit
- * counters, compacts the game’s arrays, and signals canAccept to wake an
- * acceptor blocked by maxconns.
- *
- * Parameters:
- *   arg - pointer to ServerContext (provides pending list, mutex, counters).
- *
- * Returns:
- *   NULL (runs forever under normal operation).
- *
- * Side effects:
- *   - Modifies pendingGames list entries under pendingGamesMutex.
- *   - Decrements activeClientSockets and activeClients when a pending fd dies.
- *   - Signals canAccept after freeing a connection slot.
- *   - Sleeps ~100ms per iteration via poll(NULL,0,100) (no prohibited sleeps).
- *
- * Concurrency:
- *   Acquires pendingGamesMutex while walking and editing the pending list.
- *   Uses non-blocking poll to avoid stalling the server.
- *
- * REF: Comments created by AI, reviewed and modified for assignment compliance.
- */
-static void *pending_fd_monitor_thread(void *arg) {
-    ServerContext *ctx = (ServerContext *)arg;
-    for (;;) {
-        pthread_mutex_lock(&ctx->pendingGamesMutex);
-        for (Game *g = ctx->pendingGamesHead; g; g = g->next) {
-            int pc = g->playerCount;
-            for (int s = 0; s < pc; ++s) {
-                int fd = g->playerFds[s];
-                if (fd < 0) continue;
-                struct pollfd pfd = { .fd = fd, .events = 0, .revents = 0 };
-                int r = poll(&pfd, 1, 0);
-                if (r > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))) {
-                    // Remove this pending player and compact arrays
-                    close(fd);
-                    atomic_fetch_sub(&ctx->activeClientSockets, 1u);   // NEW: keep live count correct
-                    if (g->playerNames[s]) { free(g->playerNames[s]); g->playerNames[s] = NULL; }
-                    for (int t = s + 1; t < pc; ++t) {
-                        g->playerFds[t - 1]   = g->playerFds[t];
-                        g->playerNames[t - 1] = g->playerNames[t];
-                    }
-                    g->playerFds[pc - 1] = -1;
-                    g->playerNames[pc - 1] = NULL;
-                    g->playerCount--;
-                    if (ctx->activeClients > 0) { ctx->activeClients--; }
-                    pthread_cond_signal(&ctx->canAccept);
-                    pc = g->playerCount;
-                    s--; // re-check current index after compaction
-                }
-            }
-        }
-        pthread_mutex_unlock(&ctx->pendingGamesMutex);
-        (void)poll(NULL, 0, MAX_SLEEP_TIME); // 100ms sleep via poll (no prohibited nanosleep/usleep)
-    }
-    return NULL;
-}
 
-/**
- * start_pending_fd_monitor
- * ------------------------
- * Spawns and detaches a background thread that periodically scans the
- * pending-games list for disconnected client sockets and cleans them up.
- *
- * Parameters:
- *   ctx - pointer to ServerContext shared with the monitor thread.
- *
- * Returns:
- *   None. (Thread creation failures are ignored per assignment scope.)
- *
- * Side effects:
- *   Creates a detached pthread running pending_fd_monitor_thread().
- *
- * Concurrency:
- *   The created thread will acquire pendingGamesMutex when inspecting and
- *   mutating the pending list; callers must not hold that mutex here.
- *
- * REF: Comments created by AI, reviewed and modified for assignment compliance.
- */
-static void start_pending_fd_monitor(ServerContext *ctx) {
-    pthread_t tid;
-    (void)pthread_create(&tid, NULL, pending_fd_monitor_thread, ctx);
-    (void)pthread_detach(tid);
-}
 
 
 
@@ -2054,7 +1969,6 @@ int main(int argc, char** argv) {
 
     // Start SIGHUP stats thread + pending-FD monitor
     start_sighup_stats_thread(&serverCtx);
-    start_pending_fd_monitor(&serverCtx);
 
     // Serve forever
     accept_loop(listenFd, greeting, &serverCtx);

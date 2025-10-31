@@ -1,0 +1,94 @@
+CSSE2310/7231 – AI Assistance Log (toolHistory.txt)
+==================================================
+Student ID (shell user): s4938484
+Assignment: A4 – ratsserver / ratsclient
+Model: GPT-5 Thinking
+Timestamp (Australia/Brisbane): 2025-10-28 23:08:22 UTC+10:00+1000
+
+Scope
+-----
+This file records where AI-generated documentation comments were added to the codebase.
+Each comment block includes the line: "REF: Comments created by AI, reviewed and modified for assignment compliance."
+No functional behaviour was intentionally changed as part of these edits (comments only).
+
+Files & Functions Documented
+----------------------------
+
+1) ratsserver.c — Server startup, networking, and connection handling
+   • die_usage — Usage string, exit semantics.
+   • parse_maxconns — Validates maxconns argument per spec constraints.
+   • listen_and_report_port — Binds/listens; prints bound port; handles invalid ports.
+   • block_sigpipe_all_threads — Blocks SIGPIPE process-wide via pthread_sigmask.
+   • client_greeting_thread — Sends greeting, parses join info, registers player, triggers game start.
+   • accept_loop — Accepts clients under max-connection limit; spawns handler threads.
+   • read_line_alloc — getline wrapper; trims CR/LF; malloc-ownership clarified.
+   • send_line — Single-line send with newline and flush.
+   • read_join_info — Reads player name and game name lines.
+   • get_or_create_pending_game — Looks up or creates pending game structure (locked).
+   • add_player_to_pending_game — Adds a player seat to pending game (locked).
+   • handle_client_join — Orchestrates join protocol and registry updates.
+   • unlink_pending_game — Removes full game from pending list (locked).
+   • acquire_conn_slot — Connection limiting (mutex/condvar).
+   • release_conn_slot — Releases slot and signals waiter.
+
+2) ratsserver.c — Gameplay orchestration & helpers
+   • start_game — Seats players (alphabetically), announces teams, deals hands, runs game lifecycle, updates stats.
+   • broadcast_msg — fprintf-style fanout to all player outputs.
+   • deal_and_send_hands — Distributes 26 cards per player from 104-char deck string.
+   • get_deck_or_die — Fetches deck via course library; exits on system error path.
+   • rank_value — Rank strength mapping (2..A).
+   • is_valid_rank — Rank validator using rank_value.
+   • is_valid_suit — Accepts suits S/C/D/H.
+   • winning_seat_in_trick — Determines trick winner constrained to lead suit.
+   • build_hands_from_deck — Builds PlayerHand arrays from deck string layout.
+   • has_suit_in_hand — Checks for follow-suit requirement.
+   • remove_card_from_hand — Removes a specific rank/suit from a PlayerHand.
+   • parse_card_token — Validates a two-character card token (R,S).
+   • play_tricks — Full trick loop (L/P?/I/A flow), disconnection handling, stats tick.
+   • announce_play — Optional informational message (name or Px) to other players.
+   • announce_trick_winner — Announces trick winner (Px label).
+   • seat_to_team — Seats 0/2 ⇒ Team 0, 1/3 ⇒ Team 1.
+   • announce_final_score — Broadcasts winner and trick counts; sends 'O' at end.
+
+3) ratsserver.c — Statistics, SIGHUP, and pending-FD monitoring
+   • stats_sigwait_thread — SIGHUP sigwait loop; prints stats to stderr.
+   • start_sighup_stats_thread — Blocks SIGHUP globally; starts detached stats thread.
+   • pending_fd_monitor_thread — Polls pending sockets; cleans up HUP/ERR/NVAL; adjusts live-socket count and slots.
+   • start_pending_fd_monitor — Starts detached monitor thread.
+
+4) ratsclient.c — Client utility & interaction (prototypes supplied by student)
+   • validate_arguments — Validates CLI per client spec.
+   • check_and_connect_port — Resolves service/port and connects.
+   • setup_server_streams — Wraps socket in FILE* streams (r/w).
+   • send_client_info — Sends player and game names per protocol.
+   • display_cards — Renders a subset of cards for UI.
+   • display_hand — Renders the full hand with consistent ordering.
+   • parse_hand_message — Parses 'H...' hand message to Hand structure.
+   • handle_message — Routes server messages (L/P?/I/A/O/M/H).
+   • handle_lead — Processes 'L' prompt; reads/validates user's lead.
+   • handle_play — Processes 'P?' prompt; validates follow-suit rule.
+   • handle_accept — Applies 'A' acknowledgement; removes last-sent card.
+   • get_rank_value — Rank mapping for client-side sorting/display.
+   • get_suit_value — Suit ordering for client-side sorting/display.
+   • compare_cards — qsort comparator for hand display.
+   • remove_card_from_hand — Removes a specific token from Hand (client struct).
+   • card_in_hand — Returns index of rank/suit in Hand or -1.
+
+Comment Standard
+----------------
+• Each block describes Purpose, Parameters, Returns, Side effects/Notes (where relevant).
+• Tags line: "REF: Comments created by AI, reviewed and modified for assignment compliance."
+• Comments adhere to CSSE2310 style guidance for clarity and traceability.
+
+Audit Notes
+-----------
+• No prohibited libc calls were introduced by comment work.
+• No behaviour/logic changes were made in comment-only edits.
+• Where server/client had similarly named helpers (e.g., remove_card_from_hand),
+  comments explicitly mention the data structure they mutate to avoid confusion.
+
+Suggested Commit Message
+------------------------
+docs: add CSSE2310-style doc comments (AI-generated, student-reviewed) to server/client helpers and gameplay flow
+
+End of file.
